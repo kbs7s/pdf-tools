@@ -3,6 +3,7 @@
 Free PDF tools for family use that run entirely in the browser, inspired by [Stirling-PDF](https://github.com/Stirling-Tools/Stirling-PDF).
 Files are processed on your own device and are never uploaded. Works on phones and computers, in English and Arabic,
 and can be installed to the home screen (works offline after the first visit).
+Once installed on Android, PDFs and images can be shared into it from other apps (WhatsApp, Files, etc.).
 
 **Live site:** https://kbs7s.github.io/pdf-tools/
 
@@ -11,7 +12,10 @@ and can be installed to the home screen (works offline after the first visit).
 - Merge PDFs
 - Split PDF (every page, every N pages, custom ranges, extract pages)
 - Organize pages (reorder, rotate, delete)
-- Compress PDF
+- Compress PDF (smart mode keeps text; maximum mode turns pages into images)
+- Crop pages
+- Redact (permanently black out private information)
+- Scan with camera (automatic paper edge detection, perspective fix, clean-up)
 - Images to PDF / PDF to images
 - Page numbers
 - Watermark

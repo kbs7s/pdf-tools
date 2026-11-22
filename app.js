@@ -197,6 +197,9 @@ const ICONS = {
   ocr: ic('<path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 8h10M7 12h10M7 16h6"/>'),
   protect: ic('<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>'),
   unlock: ic('<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.9-1"/>'),
+  scan: ic('<path d="M3 8V6a2 2 0 0 1 2-2h2M17 4h2a2 2 0 0 1 2 2v2M21 16v2a2 2 0 0 1-2 2h-2M7 20H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3.5"/>'),
+  crop: ic('<path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/>'),
+  redact: ic('<rect x="3" y="5" width="18" height="14" rx="2"/><rect x="6" y="9" width="8" height="3" fill="currentColor"/><path d="M6 15h12"/>'),
   upload: ic('<path d="M12 16V4"/><path d="m6 10 6-6 6 6"/><path d="M4 20h16"/>'),
 };
 
@@ -339,6 +342,9 @@ const TOOLS = [
   { id: 'rotate', render: toolOrganize },
   { id: 'delete', render: toolOrganize },
   { id: 'compress', render: toolCompress },
+  { id: 'crop', render: toolCrop },
+  { id: 'redact', render: toolRedact },
+  { id: 'scan', render: toolScan },
   { id: 'img2pdf', render: toolImg2Pdf },
   { id: 'pdf2img', render: toolPdf2Img },
   { id: 'numbers', render: toolNumbers },
@@ -523,43 +529,6 @@ function toolOrganize(id) {
     }));
     body.appendChild(wrap);
     draw();
-  });
-  return v;
-}
-
-/* Compress */
-function toolCompress() {
-  const v = toolShell('compress');
-  const body = v.querySelector('.body');
-  singlePdf(body, async (file, bytes) => {
-    const js = await loadJs(bytes);
-    const opts = h(`<div>
-        <p class="hint">${esc(t('pages', { n: js.numPages }))}</p>
-        <div class="field" style="margin-top:12px"><span>${esc(t('level'))}</span>
-          ${seg('lvl', [['light', t('lvlLight')], ['medium', t('lvlMedium')], ['strong', t('lvlStrong')]], 'medium')}</div>
-        <p class="warn">${esc(t('compressNote'))}</p>
-        <div class="btn-row"><button class="btn primary" data-go>${esc(t('compressBtn'))}</button></div></div>`);
-    opts.querySelector('[data-go]').addEventListener('click', () => run(v, async () => {
-      const L = { light: [2, 0.75], medium: [1.5, 0.6], strong: [1.1, 0.45] }[val(opts, 'lvl')];
-      const out = await PDFDocument.create();
-      for (let i = 1; i <= js.numPages; i++) {
-        await progress(t('processingPage', { n: i, total: js.numPages }));
-        const { canvas, width, height } = await renderPage(js, i, { scale: L[0], maxSide: 3000 });
-        const blob = await canvasBlob(canvas, 'image/jpeg', L[1]);
-        canvas.width = canvas.height = 0;
-        const img = await out.embedJpg(new Uint8Array(await blob.arrayBuffer()));
-        const page = out.addPage([width, height]);
-        page.drawImage(img, { x: 0, y: 0, width, height });
-      }
-      let data = await out.save();
-      const smaller = data.length < bytes.length;
-      const pct = Math.round((1 - data.length / bytes.length) * 100);
-      const info = `<p>${esc(t('sizeChange', { a: fmtSize(bytes.length), b: fmtSize(data.length) }))} ${pct > 0 ? `(−${pct}%)` : ''}</p>`
-        + (smaller ? '' : `<p class="warn">${esc(t('compressNoGain'))}</p>`);
-      if (!smaller) data = bytes;
-      await showResult(v, [{ name: baseName(file.name) + '-compressed.pdf', data }], info);
-    }));
-    body.appendChild(opts);
   });
   return v;
 }
@@ -1400,6 +1369,521 @@ function toolForms() {
   return v;
 }
 
+/* Compress (two modes: smart keeps text, maximum turns pages into images) */
+async function inflate(bytes) {
+  const s = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
+  return new Uint8Array(await new Response(s).arrayBuffer());
+}
+async function smartCompress(bytes, maxSide, quality) {
+  const L = window.PDFLib; const { PDFName, PDFRawStream, PDFArray, PDFNumber } = L;
+  const doc = await loadLib(bytes);
+  const N = k => PDFName.of(k);
+  const num = o => (o instanceof PDFNumber ? o.asNumber() : 0);
+  const objs = doc.context.enumerateIndirectObjects();
+  let changed = 0, k = 0;
+  for (const [ref, obj] of objs) {
+    k++;
+    if (!(obj instanceof PDFRawStream)) continue;
+    const d = obj.dict;
+    if (String(d.get(N('Subtype'))) !== '/Image' || d.get(N('ImageMask')) || d.get(N('Decode'))) continue;
+    const w = num(d.lookup(N('Width'))), hgt = num(d.lookup(N('Height')));
+    if (w * hgt < 40000 || obj.contents.length < 15000) continue;
+    let f = d.lookup(N('Filter'));
+    if (f instanceof PDFArray) f = f.size() === 1 ? f.lookup(0) : null;
+    const filter = f ? String(f) : '';
+    let cs = d.lookup(N('ColorSpace')), comps = 0;
+    if (cs instanceof PDFName) comps = { '/DeviceRGB': 3, '/DeviceGray': 1 }[String(cs)] || 0;
+    else if (cs instanceof PDFArray && String(cs.lookup(0)) === '/ICCBased') { const s = cs.lookup(1); comps = s && s.dict ? num(s.dict.lookup(N('N'))) : 0; if (comps !== 1 && comps !== 3) comps = 0; }
+    if (!comps) continue;
+    if (k % 5 === 0) await progress(t('compressImages', { n: changed }));
+    const scale = Math.min(1, maxSide / Math.max(w, hgt));
+    const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(w * scale)); c.height = Math.max(1, Math.round(hgt * scale));
+    const ctx = c.getContext('2d');
+    try {
+      if (filter === '/DCTDecode') {
+        const bmp = await createImageBitmap(new Blob([obj.contents], { type: 'image/jpeg' }));
+        ctx.drawImage(bmp, 0, 0, c.width, c.height); bmp.close && bmp.close();
+      } else if (filter === '/FlateDecode' && num(d.lookup(N('BitsPerComponent'))) === 8) {
+        const dp = d.lookup(N('DecodeParms'));
+        if (dp && num(dp.lookup?.(N('Predictor'))) > 1) continue;
+        const raw = await inflate(obj.contents);
+        if (raw.length < w * hgt * comps) continue;
+        const id = new ImageData(w, hgt);
+        for (let i = 0, j = 0; i < w * hgt; i++, j += comps) {
+          const o = i * 4;
+          if (comps === 3) { id.data[o] = raw[j]; id.data[o + 1] = raw[j + 1]; id.data[o + 2] = raw[j + 2]; }
+          else id.data[o] = id.data[o + 1] = id.data[o + 2] = raw[j];
+          id.data[o + 3] = 255;
+        }
+        const tmp = document.createElement('canvas'); tmp.width = w; tmp.height = hgt; tmp.getContext('2d').putImageData(id, 0, 0);
+        ctx.drawImage(tmp, 0, 0, c.width, c.height); tmp.width = tmp.height = 0;
+      } else continue;
+    } catch { continue; }
+    const jpg = new Uint8Array(await (await canvasBlob(c, 'image/jpeg', quality)).arrayBuffer());
+    c.width = c.height = 0;
+    if (jpg.length >= obj.contents.length * 0.9) continue;
+    const nd = doc.context.obj({});
+    for (const [key, value] of d.entries()) {
+      if (!['/Filter', '/DecodeParms', '/Length', '/Width', '/Height', '/ColorSpace', '/BitsPerComponent'].includes(String(key))) nd.set(key, value);
+    }
+    nd.set(N('Width'), PDFNumber.of(Math.max(1, Math.round(w * scale)))); nd.set(N('Height'), PDFNumber.of(Math.max(1, Math.round(hgt * scale))));
+    nd.set(N('ColorSpace'), N('DeviceRGB')); nd.set(N('BitsPerComponent'), PDFNumber.of(8)); nd.set(N('Filter'), N('DCTDecode'));
+    doc.context.assign(ref, PDFRawStream.of(nd, jpg));
+    changed++;
+  }
+  return { data: await doc.save({ useObjectStreams: true }), changed };
+}
+
+function toolCompress() {
+  const v = toolShell('compress');
+  const body = v.querySelector('.body');
+  singlePdf(body, async (file, bytes) => {
+    const js = await loadJs(bytes);
+    const opts = h(`<div>
+        <p class="hint">${esc(t('pages', { n: js.numPages }))}</p>
+        <div class="field" style="margin-top:12px"><span>${esc(t('compressMode'))}</span>
+          ${seg('mode', [['smart', t('modeSmart')], ['raster', t('modeRaster')]], 'smart')}</div>
+        <div class="field" style="margin-top:12px"><span>${esc(t('level'))}</span>
+          ${seg('lvl', [['light', t('lvlLight')], ['medium', t('lvlMedium')], ['strong', t('lvlStrong')]], 'medium')}</div>
+        <p class="hint" data-note></p>
+        <div class="btn-row"><button class="btn primary" data-go>${esc(t('compressBtn'))}</button></div></div>`);
+    const note = () => { const n = opts.querySelector('[data-note]'); const smart = val(opts, 'mode') === 'smart'; n.textContent = t(smart ? 'smartNote' : 'compressNote'); n.className = smart ? 'hint' : 'warn'; };
+    opts.addEventListener('change', note); note();
+    opts.querySelector('[data-go]').addEventListener('click', () => run(v, async () => {
+      const lvl = val(opts, 'lvl');
+      let data;
+      if (val(opts, 'mode') === 'smart') {
+        const S = { light: [2400, 0.8], medium: [1600, 0.68], strong: [1100, 0.5] }[lvl];
+        ({ data } = await smartCompress(bytes, S[0], S[1]));
+      } else {
+        const R = { light: [2, 0.75], medium: [1.5, 0.6], strong: [1.1, 0.45] }[lvl];
+        const out = await PDFDocument.create();
+        for (let i = 1; i <= js.numPages; i++) {
+          await progress(t('processingPage', { n: i, total: js.numPages }));
+          const { canvas, width, height } = await renderPage(js, i, { scale: R[0], maxSide: 3000 });
+          const blob = await canvasBlob(canvas, 'image/jpeg', R[1]);
+          canvas.width = canvas.height = 0;
+          const img = await out.embedJpg(new Uint8Array(await blob.arrayBuffer()));
+          out.addPage([width, height]).drawImage(img, { x: 0, y: 0, width, height });
+        }
+        data = await out.save();
+      }
+      const smaller = data.length < bytes.length * 0.98;
+      const pct = Math.round((1 - data.length / bytes.length) * 100);
+      const info = `<p>${esc(t('sizeChange', { a: fmtSize(bytes.length), b: fmtSize(smaller ? data.length : bytes.length) }))} ${smaller ? `(−${pct}%)` : ''}</p>`
+        + (smaller ? '' : `<p class="warn">${esc(t(val(opts, 'mode') === 'smart' ? 'smartNoGain' : 'compressNoGain'))}</p>`);
+      if (!smaller) data = bytes;
+      await showResult(v, [{ name: baseName(file.name) + '-compressed.pdf', data }], info);
+    }));
+    body.appendChild(opts);
+  });
+  return v;
+}
+
+/* ---------- small geometry helpers for the scanner ---------- */
+function otsu(gray) {
+  const hist = new Array(256).fill(0); for (const g of gray) hist[g]++;
+  const total = gray.length; let sum = 0; for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let sumB = 0, wB = 0, best = 0, th = 128;
+  for (let i = 0; i < 256; i++) {
+    wB += hist[i]; if (!wB) continue; const wF = total - wB; if (!wF) break;
+    sumB += i * hist[i]; const mB = sumB / wB, mF = (sum - sumB) / wF; const b = wB * wF * (mB - mF) ** 2;
+    if (b > best) { best = b; th = i; }
+  }
+  return th;
+}
+/** Guess the paper's 4 corners in a photo. Returns fractions [tl, tr, br, bl] or null. */
+function detectPaper(canvas) {
+  const S = 240; const sc = S / Math.max(canvas.width, canvas.height);
+  const w = Math.max(8, Math.round(canvas.width * sc)), hh = Math.max(8, Math.round(canvas.height * sc));
+  const c = document.createElement('canvas'); c.width = w; c.height = hh;
+  const ctx = c.getContext('2d'); ctx.filter = 'blur(1px)'; ctx.drawImage(canvas, 0, 0, w, hh);
+  const px = ctx.getImageData(0, 0, w, hh).data; const gray = new Uint8Array(w * hh);
+  for (let i = 0; i < w * hh; i++) gray[i] = (px[i * 4] * 0.3 + px[i * 4 + 1] * 0.59 + px[i * 4 + 2] * 0.11) | 0;
+  const th = otsu(gray);
+  const lab = new Int32Array(w * hh).fill(-1); let bestId = -1, bestSize = 0, id = 0; const stack = [];
+  for (let s = 0; s < w * hh; s++) {
+    if (gray[s] <= th || lab[s] !== -1) continue;
+    let size = 0; stack.push(s); lab[s] = id;
+    while (stack.length) {
+      const p = stack.pop(); size++; const x = p % w, y = (p / w) | 0;
+      for (const q of [x > 0 ? p - 1 : -1, x < w - 1 ? p + 1 : -1, y > 0 ? p - w : -1, y < hh - 1 ? p + w : -1]) {
+        if (q >= 0 && lab[q] === -1 && gray[q] > th) { lab[q] = id; stack.push(q); }
+      }
+    }
+    if (size > bestSize) { bestSize = size; bestId = id; }
+    id++;
+  }
+  if (bestSize < w * hh * 0.15 || bestSize > w * hh * 0.97) return null;
+  let tl, tr, br, bl, a = Infinity, b = -Infinity, cc = -Infinity, dd = Infinity;
+  for (let p = 0; p < w * hh; p++) {
+    if (lab[p] !== bestId) continue; const x = p % w, y = (p / w) | 0;
+    if (x + y < a) { a = x + y; tl = [x, y]; } if (x + y > b) { b = x + y; br = [x, y]; }
+    if (x - y > cc) { cc = x - y; tr = [x, y]; } if (x - y < dd) { dd = x - y; bl = [x, y]; }
+  }
+  return [tl, tr, br, bl].map(([x, y]) => ({ x: x / (w - 1), y: y / (hh - 1) }));
+}
+/** Perspective-correct the quad (pixel corners tl,tr,br,bl) of src into a flat rectangle. */
+function warpQuad(src, q, maxOut = 2200) {
+  const d = (p, r) => Math.hypot(p.x - r.x, p.y - r.y);
+  let W = Math.max(d(q[0], q[1]), d(q[3], q[2])), H = Math.max(d(q[0], q[3]), d(q[1], q[2]));
+  const s = Math.min(1, maxOut / Math.max(W, H)); W = Math.max(2, Math.round(W * s)); H = Math.max(2, Math.round(H * s));
+  // square -> quad homography
+  const [p0, p1, p2, p3] = q;
+  const dx1 = p1.x - p2.x, dx2 = p3.x - p2.x, dy1 = p1.y - p2.y, dy2 = p3.y - p2.y;
+  const sx = p0.x - p1.x + p2.x - p3.x, sy = p0.y - p1.y + p2.y - p3.y;
+  const den = dx1 * dy2 - dx2 * dy1 || 1e-9;
+  const g = (sx * dy2 - dx2 * sy) / den, hh = (dx1 * sy - sx * dy1) / den;
+  const a = p1.x - p0.x + g * p1.x, b = p3.x - p0.x + hh * p3.x, c = p0.x;
+  const dd = p1.y - p0.y + g * p1.y, e = p3.y - p0.y + hh * p3.y, f = p0.y;
+  const sctx = src.getContext('2d'); const sd = sctx.getImageData(0, 0, src.width, src.height).data; const SW = src.width, SH = src.height;
+  const out = document.createElement('canvas'); out.width = W; out.height = H;
+  const octx = out.getContext('2d'); const od = octx.createImageData(W, H); const o = od.data;
+  for (let y = 0; y < H; y++) {
+    const v = y / (H - 1);
+    for (let x = 0; x < W; x++) {
+      const u = x / (W - 1); const z = g * u + hh * v + 1;
+      let X = (a * u + b * v + c) / z, Y = (dd * u + e * v + f) / z;
+      X = Math.min(SW - 1.001, Math.max(0, X)); Y = Math.min(SH - 1.001, Math.max(0, Y));
+      const x0 = X | 0, y0 = Y | 0, fx = X - x0, fy = Y - y0;
+      const i00 = (y0 * SW + x0) * 4, i10 = i00 + 4, i01 = i00 + SW * 4, i11 = i01 + 4; const k = (y * W + x) * 4;
+      for (let ch = 0; ch < 3; ch++) {
+        o[k + ch] = (sd[i00 + ch] * (1 - fx) + sd[i10 + ch] * fx) * (1 - fy) + (sd[i01 + ch] * (1 - fx) + sd[i11 + ch] * fx) * fy;
+      }
+      o[k + 3] = 255;
+    }
+  }
+  octx.putImageData(od, 0, 0);
+  return out;
+}
+/** Clean-up filters: 'color' (light boost), 'gray', 'doc' (flattened lighting, crisp black on white). */
+function enhance(src, mode) {
+  const W = src.width, H = src.height;
+  const out = document.createElement('canvas'); out.width = W; out.height = H;
+  const ctx = out.getContext('2d'); ctx.drawImage(src, 0, 0);
+  if (mode === 'original') return out;
+  const id = ctx.getImageData(0, 0, W, H); const p = id.data;
+  if (mode === 'color') {
+    for (let i = 0; i < p.length; i += 4) for (let c = 0; c < 3; c++) p[i + c] = Math.min(255, Math.max(0, (p[i + c] - 128) * 1.15 + 140));
+  } else {
+    // background estimate: heavy blur at low resolution
+    const bw = Math.max(4, Math.round(W / 24)), bh = Math.max(4, Math.round(H / 24));
+    const b = document.createElement('canvas'); b.width = bw; b.height = bh; const bctx = b.getContext('2d');
+    bctx.filter = 'blur(2px)'; bctx.drawImage(src, 0, 0, bw, bh);
+    const big = document.createElement('canvas'); big.width = W; big.height = H; const g2 = big.getContext('2d');
+    g2.imageSmoothingQuality = 'high'; g2.drawImage(b, 0, 0, W, H);
+    const bg = g2.getImageData(0, 0, W, H).data;
+    for (let i = 0; i < p.length; i += 4) {
+      const gray = p[i] * 0.3 + p[i + 1] * 0.59 + p[i + 2] * 0.11;
+      let vOut;
+      if (mode === 'gray') vOut = gray;
+      else {
+        const bgv = Math.max(1, bg[i] * 0.3 + bg[i + 1] * 0.59 + bg[i + 2] * 0.11);
+        let r = gray / bgv; // ~1 for paper, lower for ink
+        r = (r - 0.55) / 0.33; // stretch
+        vOut = 255 * Math.min(1, Math.max(0, r)) ** 1.6;
+      }
+      p[i] = p[i + 1] = p[i + 2] = vOut;
+    }
+  }
+  ctx.putImageData(id, 0, 0);
+  return out;
+}
+
+/* Scan with camera */
+function toolScan() {
+  const v = toolShell('scan');
+  const body = v.querySelector('.body');
+  const pages = []; // {src: canvas, quad: [{x,y} fractions], rot: 0}
+  let filter = 'doc';
+  const pick = h(`<div>
+      <div class="btn-row" style="margin-top:0">
+        <label class="btn primary">${esc(t('takePhoto'))}<input type="file" accept="image/*" capture="environment" hidden data-cam></label>
+        <label class="btn">${esc(t('chooseImages'))}<input type="file" accept="image/*" multiple hidden data-pick></label>
+      </div>
+      <p class="hint">${esc(t('scanHint'))}</p>
+      <div data-editor></div>
+      <div data-list></div>
+    </div>`);
+  body.appendChild(pick);
+  const listEl = pick.querySelector('[data-list]'), editorEl = pick.querySelector('[data-editor]');
+  async function addFiles(files) {
+    await run(v, async () => {
+      for (const f of files) {
+        await progress(t('working'));
+        const src = await imageToCanvas(f, 2400);
+        const quad = detectPaper(src) || [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }];
+        pages.push({ src, quad, rot: 0 });
+      }
+    });
+    drawList();
+    if (files.length === 1) editCorners(pages[pages.length - 1]);
+  }
+  pick.querySelectorAll('input[type=file]').forEach(i => i.addEventListener('change', () => { if (i.files.length) addFiles([...i.files]); i.value = ''; }));
+
+  function processed(pg, maxOut = 2200) {
+    const q = pg.quad.map(p => ({ x: p.x * (pg.src.width - 1), y: p.y * (pg.src.height - 1) }));
+    let c = warpQuad(pg.src, q, maxOut);
+    if (pg.rot) {
+      const r = document.createElement('canvas'); const swap = pg.rot % 180 !== 0;
+      r.width = swap ? c.height : c.width; r.height = swap ? c.width : c.height;
+      const x = r.getContext('2d'); x.translate(r.width / 2, r.height / 2); x.rotate(pg.rot * Math.PI / 180); x.drawImage(c, -c.width / 2, -c.height / 2); c = r;
+    }
+    return enhance(c, filter);
+  }
+  function drawList() {
+    listEl.innerHTML = '';
+    if (!pages.length) return;
+    const fl = h(`<div class="field" style="margin-top:14px"><span>${esc(t('scanLook'))}</span>
+        ${seg('look', [['doc', t('lookDoc')], ['gray', t('lookGray')], ['color', t('lookColor')], ['original', t('lookOriginal')]], filter)}</div>`);
+    fl.addEventListener('change', () => { filter = val(fl, 'look'); drawList(); });
+    listEl.appendChild(fl);
+    const grid = h('<div class="pages"></div>');
+    pages.forEach((pg, i) => {
+      const card = h(`<div class="pg" style="cursor:default"><span class="num">${i + 1}</span><div class="box"><img alt=""></div>
+          <div class="acts">
+            <button class="icon-btn" data-a="back" title="${esc(t('moveUp'))}">${lang === 'ar' ? ICONS.right : ICONS.left}</button>
+            <button class="icon-btn" data-a="crop" title="${esc(t('adjustCorners'))}">${ICONS.crop}</button>
+            <button class="icon-btn" data-a="rot" title="${esc(t('rotRight'))}">${ICONS.rotR}</button>
+            <button class="icon-btn" data-a="del" title="${esc(t('remove'))}">${ICONS.trash}</button>
+            <button class="icon-btn" data-a="fwd" title="${esc(t('moveDown'))}">${lang === 'ar' ? ICONS.left : ICONS.right}</button>
+          </div></div>`);
+      requestAnimationFrame(() => { card.querySelector('img').src = processed(pg, 500).toDataURL('image/jpeg', 0.8); });
+      card.addEventListener('click', e => {
+        const a = e.target.closest('button')?.dataset.a; if (!a) return;
+        if (a === 'crop') return editCorners(pg);
+        if (a === 'rot') pg.rot = (pg.rot + 90) % 360;
+        if (a === 'del') pages.splice(i, 1);
+        if (a === 'back' && i > 0) [pages[i - 1], pages[i]] = [pages[i], pages[i - 1]];
+        if (a === 'fwd' && i < pages.length - 1) [pages[i + 1], pages[i]] = [pages[i], pages[i + 1]];
+        drawList();
+      });
+      grid.appendChild(card);
+    });
+    listEl.appendChild(grid);
+    const row = h(`<div class="btn-row"><button class="btn primary" data-go>${esc(t('makePdf'))}</button></div>`);
+    row.querySelector('[data-go]').addEventListener('click', () => run(v, async () => {
+      const out = await PDFDocument.create();
+      for (let i = 0; i < pages.length; i++) {
+        await progress(t('processingPage', { n: i + 1, total: pages.length }));
+        const c = processed(pages[i]);
+        const img = await out.embedJpg(new Uint8Array(await (await canvasBlob(c, 'image/jpeg', filter === 'doc' ? 0.7 : 0.8)).arrayBuffer()));
+        let [pw, ph] = [595.28, 841.89]; if (c.width > c.height) [pw, ph] = [ph, pw];
+        const s = Math.min(pw / c.width, ph / c.height); const w = c.width * s, hh = c.height * s;
+        out.addPage([pw, ph]).drawImage(img, { x: (pw - w) / 2, y: (ph - hh) / 2, width: w, height: hh });
+        c.width = c.height = 0;
+      }
+      await showResult(v, [{ name: 'scan.pdf', data: await out.save() }]);
+    }));
+    listEl.appendChild(row);
+  }
+  function editCorners(pg) {
+    editorEl.innerHTML = '';
+    const q = pg.quad.map(p => ({ ...p }));
+    const ed = h(`<div class="panel" style="margin-top:12px;padding:12px">
+        <p class="hint" style="margin-top:0">${esc(t('cornersHint'))}</p>
+        <div class="stage-wrap"><div class="stage quad-stage"><img alt="" src="${pg.src.toDataURL('image/jpeg', 0.8)}">
+          <svg class="quad" preserveAspectRatio="none" viewBox="0 0 1000 1000"><polygon /></svg>
+          ${[0, 1, 2, 3].map(i => `<span class="corner" data-c="${i}"></span>`).join('')}</div></div>
+        <div class="btn-row" style="justify-content:center"><button class="btn" data-whole>${esc(t('wholePhoto'))}</button><button class="btn primary" data-done>${esc(t('doneBtn'))}</button></div></div>`);
+    const stage = ed.querySelector('.stage'), poly = ed.querySelector('polygon');
+    const lay = () => {
+      ed.querySelectorAll('.corner').forEach((c, i) => { c.style.left = q[i].x * 100 + '%'; c.style.top = q[i].y * 100 + '%'; });
+      poly.setAttribute('points', q.map(p => `${p.x * 1000},${p.y * 1000}`).join(' '));
+    };
+    lay();
+    ed.querySelectorAll('.corner').forEach(c => c.addEventListener('pointerdown', e => {
+      e.preventDefault(); c.setPointerCapture(e.pointerId); const i = +c.dataset.c; const r = stage.getBoundingClientRect();
+      const mv = ev => { q[i].x = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)); q[i].y = Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height)); lay(); };
+      const up = () => { c.removeEventListener('pointermove', mv); c.removeEventListener('pointerup', up); c.removeEventListener('pointercancel', up); };
+      c.addEventListener('pointermove', mv); c.addEventListener('pointerup', up); c.addEventListener('pointercancel', up);
+    }));
+    ed.querySelector('[data-whole]').addEventListener('click', () => { q.splice(0, 4, { x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }); lay(); });
+    ed.querySelector('[data-done]').addEventListener('click', () => { pg.quad = q; editorEl.innerHTML = ''; drawList(); });
+    editorEl.appendChild(ed);
+    ed.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  return v;
+}
+
+/* Page viewer used by Crop and Redact */
+function pageViewer(ui, js, onShow) {
+  const total = js.numPages; const cache = new Map();
+  const stage = ui.querySelector('.stage'), img = stage.querySelector('img');
+  const view = { current: 1, w: 1, h: 1, stage, img };
+  view.show = async n => {
+    view.current = n;
+    ui.querySelector('[data-pn]').textContent = `${n} / ${total}`;
+    ui.querySelector('[data-prev]').disabled = n <= 1;
+    ui.querySelector('[data-next]').disabled = n >= total;
+    if (!cache.has(n)) {
+      busy(true);
+      try { const r = await renderPage(js, n, { width: Math.min(1400, Math.max(600, stage.parentElement.clientWidth * (window.devicePixelRatio || 1))) }); cache.set(n, { url: r.canvas.toDataURL('image/jpeg', 0.85), w: r.width, h: r.height }); }
+      finally { busy(false); }
+    }
+    const c = cache.get(n); view.w = c.w; view.h = c.h; img.src = c.url; onShow(n);
+  };
+  ui.querySelector('[data-prev]').addEventListener('click', () => view.show(view.current - 1));
+  ui.querySelector('[data-next]').addEventListener('click', () => view.show(view.current + 1));
+  return view;
+}
+const pagerHtml = () => `<div class="pager"><button class="btn small" data-prev>${esc(t('prev'))}</button><span data-pn></span><button class="btn small" data-next>${esc(t('next'))}</button></div>
+  <div class="stage-wrap"><div class="stage"><img alt=""></div></div>`;
+/** Make a rectangle element draggable (move) and resizable (corner dot). r = {x,y,w,h} fractions. */
+function rectDrag(el, stage, r, onChange) {
+  const drag = (e, fn) => {
+    e.preventDefault(); e.stopPropagation(); e.target.setPointerCapture(e.pointerId);
+    const b = stage.getBoundingClientRect(), sx = e.clientX, sy = e.clientY, o = { ...r };
+    const mv = ev => { fn(o, (ev.clientX - sx) / b.width, (ev.clientY - sy) / b.height); onChange(); };
+    const up = () => { e.target.removeEventListener('pointermove', mv); e.target.removeEventListener('pointerup', up); e.target.removeEventListener('pointercancel', up); };
+    e.target.addEventListener('pointermove', mv); e.target.addEventListener('pointerup', up); e.target.addEventListener('pointercancel', up);
+  };
+  el.addEventListener('pointerdown', e => {
+    if (e.target !== el) return;
+    drag(e, (o, dx, dy) => { r.x = Math.min(1 - r.w, Math.max(0, o.x + dx)); r.y = Math.min(1 - r.h, Math.max(0, o.y + dy)); });
+  });
+  el.querySelectorAll('[data-h]').forEach(hd => hd.addEventListener('pointerdown', e => drag(e, (o, dx, dy) => {
+    const k = hd.dataset.h;
+    if (k.includes('l')) { const nx = Math.min(o.x + o.w - 0.02, Math.max(0, o.x + dx)); r.w = o.w + (o.x - nx); r.x = nx; }
+    if (k.includes('r')) r.w = Math.min(1 - o.x, Math.max(0.02, o.w + dx));
+    if (k.includes('t')) { const ny = Math.min(o.y + o.h - 0.02, Math.max(0, o.y + dy)); r.h = o.h + (o.y - ny); r.y = ny; }
+    if (k.includes('b')) r.h = Math.min(1 - o.y, Math.max(0.01, o.h + dy));
+  })));
+}
+const placeRect = (el, r) => { el.style.left = r.x * 100 + '%'; el.style.top = r.y * 100 + '%'; el.style.width = r.w * 100 + '%'; el.style.height = r.h * 100 + '%'; };
+/** Visual rect (fractions, top-left origin) -> PDF user-space rectangle. */
+function rectToUser(page, r) {
+  const box = visualBox(page);
+  const a = toUser(box, r.x * box.vw, box.vh - (r.y + r.h) * box.vh), b = toUser(box, (r.x + r.w) * box.vw, box.vh - r.y * box.vh);
+  return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), width: Math.abs(a.x - b.x), height: Math.abs(a.y - b.y) };
+}
+
+/* Crop */
+function toolCrop() {
+  const v = toolShell('crop');
+  const body = v.querySelector('.body');
+  singlePdf(body, async (file, bytes) => {
+    const js = await loadJs(bytes);
+    const r = { x: 0.08, y: 0.08, w: 0.84, h: 0.84 };
+    const ui = h(`<div style="margin-top:14px">
+        <p class="hint" style="margin-top:0">${esc(t('cropHint'))}</p>
+        <div class="field"><span>${esc(t('applyTo'))}</span>${seg('scope', [['all', t('allPages')], ['this', t('thisPage')]], 'all')}</div>
+        ${pagerHtml()}
+        <div class="btn-row" style="justify-content:center"><button class="btn primary" data-save>${esc(t('cropBtn'))}</button></div></div>`);
+    body.appendChild(ui);
+    const view = pageViewer(ui, js, () => {});
+    const el = h(`<div class="crop-rect">${['tl', 'tr', 'bl', 'br'].map(k => `<span class="hd" data-h="${k}"></span>`).join('')}</div>`);
+    view.stage.appendChild(el); placeRect(el, r);
+    rectDrag(el, view.stage, r, () => placeRect(el, r));
+    ui.querySelector('[data-save]').addEventListener('click', () => run(v, async () => {
+      const doc = await loadLib(bytes); const pages = doc.getPages();
+      const targets = val(ui, 'scope') === 'all' ? pages : [pages[view.current - 1]];
+      for (const p of targets) { const u = rectToUser(p, r); p.setMediaBox(u.x, u.y, u.width, u.height); p.setCropBox(u.x, u.y, u.width, u.height); }
+      await showResult(v, [{ name: baseName(file.name) + '-cropped.pdf', data: await doc.save() }]);
+    }));
+    view.show(1);
+  });
+  return v;
+}
+
+/* Redact */
+function toolRedact() {
+  const v = toolShell('redact');
+  const body = v.querySelector('.body');
+  singlePdf(body, async (file, bytes) => {
+    const js = await loadJs(bytes);
+    const boxes = []; // {page, x, y, w, h}
+    const ui = h(`<div style="margin-top:14px">
+        <p class="hint" style="margin-top:0">${esc(t('redactHint'))}</p>
+        ${pagerHtml()}
+        <p class="warn">${esc(t('redactNote'))}</p>
+        <div class="btn-row" style="justify-content:center"><button class="btn primary" data-save>${esc(t('redactBtn'))}</button></div></div>`);
+    body.appendChild(ui);
+    const view = pageViewer(ui, js, () => draw());
+    function draw() {
+      view.stage.querySelectorAll('.redact-box').forEach(n => n.remove());
+      for (const b of boxes.filter(x => x.page === view.current)) {
+        const el = h(`<div class="redact-box"><button class="x" type="button">×</button><span class="hd" data-h="br"></span></div>`);
+        placeRect(el, b);
+        el.querySelector('.x').addEventListener('pointerdown', e => e.stopPropagation());
+        el.querySelector('.x').addEventListener('click', e => { e.stopPropagation(); boxes.splice(boxes.indexOf(b), 1); draw(); });
+        rectDrag(el, view.stage, b, () => placeRect(el, b));
+        view.stage.appendChild(el);
+      }
+    }
+    view.stage.addEventListener('click', e => {
+      if (e.target !== view.img) return;
+      const r = view.stage.getBoundingClientRect(); const fx = (e.clientX - r.left) / r.width, fy = (e.clientY - r.top) / r.height;
+      const w = 0.3, hh = 0.035;
+      boxes.push({ page: view.current, w, h: hh, x: Math.min(1 - w, Math.max(0, fx - w / 2)), y: Math.min(1 - hh, Math.max(0, fy - hh / 2)) });
+      draw();
+    });
+    ui.querySelector('[data-save]').addEventListener('click', () => run(v, async () => {
+      if (!boxes.length) throw new Error(t('redactNothing'));
+      const doc = await loadLib(bytes);
+      const pageNums = [...new Set(boxes.map(b => b.page))].sort((a, b) => a - b);
+      for (const n of pageNums) {
+        await progress(t('processingPage', { n, total: js.numPages }));
+        const { canvas, width, height } = await renderPage(js, n, { scale: 200 / 72, maxSide: 3500 });
+        const ctx = canvas.getContext('2d'); ctx.fillStyle = '#000';
+        for (const b of boxes.filter(x => x.page === n)) ctx.fillRect(b.x * canvas.width, b.y * canvas.height, b.w * canvas.width, b.h * canvas.height);
+        const img = await doc.embedJpg(new Uint8Array(await (await canvasBlob(canvas, 'image/jpeg', 0.85)).arrayBuffer()));
+        canvas.width = canvas.height = 0;
+        const np = doc.insertPage(n - 1, [width, height]);
+        np.drawImage(img, { x: 0, y: 0, width, height });
+        doc.removePage(n);
+      }
+      await showResult(v, [{ name: baseName(file.name) + '-redacted.pdf', data: await doc.save() }]);
+    }));
+    view.show(1);
+  });
+  return v;
+}
+
+/* Files shared into the app (Android share sheet, or "Open with" on desktop) */
+let incomingFiles = null;
+async function readSharedFiles() {
+  try {
+    const cache = await caches.open('shared-files');
+    const keys = await cache.keys(); const files = [];
+    for (const k of keys) {
+      const r = await cache.match(k); const blob = await r.blob();
+      files.push(new File([blob], decodeURIComponent(r.headers.get('x-name') || 'file'), { type: blob.type }));
+      await cache.delete(k);
+    }
+    return files;
+  } catch { return []; }
+}
+function sharedView() {
+  const v = h(`<section><div class="tool-head"><a class="back" href="#">${lang === 'ar' ? '→' : '←'} ${esc(t('back'))}</a><h2>${esc(t('sharedTitle'))}</h2></div>
+      <p class="tool-desc" data-names></p><div class="grid"></div></section>`);
+  (async () => {
+    if (!incomingFiles || !incomingFiles.length) incomingFiles = await readSharedFiles();
+    const files = incomingFiles || [];
+    if (!files.length) { v.querySelector('[data-names]').textContent = t('sharedNone'); return; }
+    v.querySelector('[data-names]').textContent = t('sharedPick', { names: files.map(f => f.name).join(', ') });
+    const isPdf = files.some(f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name));
+    const ids = isPdf ? TOOLS.map(x => x.id).filter(id => !['img2pdf', 'scan'].includes(id)) : ['img2pdf', 'scan', 'ocr'];
+    const g = v.querySelector('.grid');
+    for (const id of ids) g.appendChild(h(`<a class="tool-card" href="#${id}"><div class="ico">${ICONS[id]}</div><b>${esc(t('t_' + id))}</b><span>${esc(t('d_' + id))}</span></a>`));
+  })();
+  return v;
+}
+function feedIncoming(view) {
+  if (!incomingFiles || !incomingFiles.length) return;
+  const files = incomingFiles; incomingFiles = null;
+  const inp = view.querySelector('.drop input, input[data-pick]');
+  if (!inp) return;
+  try { const dt = new DataTransfer(); files.forEach(f => dt.items.add(f)); inp.files = dt.files; inp.dispatchEvent(new Event('change')); } catch {}
+}
+if ('launchQueue' in window) {
+  window.launchQueue.setConsumer(async params => {
+    if (!params.files || !params.files.length) return;
+    incomingFiles = await Promise.all(params.files.map(fh => fh.getFile()));
+    location.hash = 'shared'; route(true);
+  });
+}
+
 /* ---------------- router ---------------- */
 let lastHash = null;
 function route(force) {
@@ -1408,7 +1892,9 @@ function route(force) {
   lastHash = id;
   const tool = TOOLS.find(x => x.id === id);
   $app.innerHTML = '';
-  $app.appendChild(tool ? tool.render(tool.id) : home());
+  const view = tool ? tool.render(tool.id) : id === 'shared' ? sharedView() : home();
+  $app.appendChild(view);
+  if (tool) feedIncoming(view);
   window.scrollTo(0, 0);
 }
 window.addEventListener('hashchange', () => route());
