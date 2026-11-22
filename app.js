@@ -117,7 +117,8 @@ function drawImageVisual(page, box, img, cx, cy, w, hgt, angle = 0, opacity = 1)
   const vx = cx - (w / 2 * Math.cos(a) - hgt / 2 * Math.sin(a));
   const vy = cy - (w / 2 * Math.sin(a) + hgt / 2 * Math.cos(a));
   const p = toUser(box, vx, vy);
-  page.drawImage(img, { x: p.x, y: p.y, width: w, height: hgt, rotate: degrees(box.rot + angle), opacity });
+  const o = { x: p.x, y: p.y, width: w, height: hgt, rotate: degrees(box.rot + angle), opacity };
+  if (img instanceof window.PDFLib.PDFEmbeddedPage) page.drawPage(img, o); else page.drawImage(img, o);
 }
 
 const hasArabic = s => /[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]/.test(s);
@@ -128,16 +129,20 @@ function textCanvas(text, { px = 48, color = '#000', family = 'system-ui, sans-s
   const ctx = c.getContext('2d');
   const font = `${weight} ${px * scale}px ${family}`;
   ctx.font = font;
-  const w = Math.ceil(ctx.measureText(text).width + px * scale * 0.4);
-  const hh = Math.ceil(px * scale * 1.5);
+  const lines = String(text).split(/\r?\n/);
+  const pad = px * scale * 0.2, lineH = px * scale * 1.3;
+  const w = Math.ceil(Math.max(...lines.map(l => ctx.measureText(l).width)) + pad * 2);
+  const hh = Math.ceil(lines.length === 1 ? px * scale * 1.5 : lineH * lines.length + px * scale * 0.3);
   c.width = Math.max(w, 4); c.height = hh;
   ctx.font = font;
-  const firstStrong = text.match(/[A-Za-z\u00C0-\u024F\u0590-\u08FF\uFB1D-\uFEFF]/);
-  ctx.direction = firstStrong && hasArabic(firstStrong[0]) ? 'rtl' : 'ltr';
-  ctx.textAlign = 'center';
+  const firstStrong = String(text).match(/[A-Za-z\u00C0-\u024F\u0590-\u08FF\uFB1D-\uFEFF]/);
+  const rtl = !!(firstStrong && hasArabic(firstStrong[0]));
+  ctx.direction = rtl ? 'rtl' : 'ltr';
+  ctx.textAlign = lines.length === 1 ? 'center' : (rtl ? 'right' : 'left');
   ctx.textBaseline = 'middle';
   ctx.fillStyle = color;
-  ctx.fillText(text, c.width / 2, c.height / 2);
+  const x = lines.length === 1 ? c.width / 2 : (rtl ? c.width - pad : pad);
+  lines.forEach((l, i) => ctx.fillText(l, x, lines.length === 1 ? c.height / 2 : px * scale * 0.15 + lineH * (i + 0.5)));
   return { canvas: c, width: c.width / scale, height: c.height / scale };
 }
 async function embedCanvasPng(doc, canvas) {
@@ -187,6 +192,11 @@ const ICONS = {
   rotL: ic('<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>'),
   rotR: ic('<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>'),
   trash: ic('<path d="M3 6h18"/><path d="M19 6l-1 14H6L5 6"/>'),
+  edit: ic('<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>'),
+  forms: ic('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9h4M7 14h10"/><path d="m14 8 1.5 1.5L18 7"/>'),
+  ocr: ic('<path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 8h10M7 12h10M7 16h6"/>'),
+  protect: ic('<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>'),
+  unlock: ic('<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.9-1"/>'),
   upload: ic('<path d="M12 16V4"/><path d="m6 10 6-6 6 6"/><path d="M4 20h16"/>'),
 };
 
@@ -334,6 +344,11 @@ const TOOLS = [
   { id: 'numbers', render: toolNumbers },
   { id: 'watermark', render: toolWatermark },
   { id: 'sign', render: toolSign },
+  { id: 'edit', render: toolEdit },
+  { id: 'forms', render: toolForms },
+  { id: 'ocr', render: toolOcr },
+  { id: 'protect', render: toolProtect },
+  { id: 'unlock', render: toolUnlock },
 ];
 
 function home() {
@@ -971,6 +986,416 @@ function toolSign() {
       }
       await showResult(v, [{ name: baseName(file.name) + '-signed.pdf', data: await doc.save() }]);
     }));
+  });
+  return v;
+}
+
+/* ---------------- lazy-loaded engines ---------------- */
+const libUrl = p => new URL('lib/' + p, location.href).href;
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    const s = document.createElement('script'); s.src = src;
+    s.onload = res; s.onerror = () => rej(new Error(t('loadFailed')));
+    document.head.appendChild(s);
+  });
+}
+
+let qpdfFactory = null;
+/** Run qpdf (compiled to WebAssembly) on one input file. Returns { rc, out, errs }. */
+async function runQpdf(input, args) {
+  if (!qpdfFactory) { await loadScript(libUrl('qpdf/qpdf.js')); qpdfFactory = window.Module; }
+  const errs = [];
+  const q = await qpdfFactory({ locateFile: f => libUrl('qpdf/' + f), print: () => {}, printErr: m => errs.push(m) });
+  q.FS.writeFile('/in.pdf', input);
+  let rc;
+  try { rc = q.callMain(args.map(a => a === '@in' ? '/in.pdf' : a === '@out' ? '/out.pdf' : a)); }
+  catch (e) { rc = e && typeof e.status === 'number' ? e.status : 2; if (!(e && typeof e.status === 'number')) errs.push(String(e && e.message || e)); }
+  let out = null; try { out = q.FS.readFile('/out.pdf'); } catch {}
+  // qpdf exit codes: 0 = ok, 3 = ok with warnings, 2 = error
+  return { rc, out: rc === 2 ? null : out, errs: errs.join('\n') };
+}
+
+/** Is this PDF locked? 'open' = needs a password to open, 'restricted' = opens but has edit restrictions, null = not protected. */
+async function lockState(bytes) {
+  try { const d = await pdfjsLib.getDocument({ data: bytes.slice(), isEvalSupported: false }).promise; d.destroy(); }
+  catch (e) { if (e && e.name === 'PasswordException') return 'open'; throw new Error(friendlyError(e)); }
+  try { await PDFDocument.load(bytes); return null; }
+  catch (e) { if (/encrypt/i.test(String(e && e.message))) return 'restricted'; throw new Error(friendlyError(e)); }
+}
+
+function pwField(name, label) {
+  return `<label class="field"><span>${esc(label)}</span><input type="password" name="${name}" autocomplete="new-password" dir="ltr"></label>`;
+}
+function wireShowPw(root) {
+  const cb = root.querySelector('[name=showpw]');
+  cb?.addEventListener('change', () => root.querySelectorAll('input[type=password],input[data-pw]').forEach(i => { i.dataset.pw = 1; i.type = cb.checked ? 'text' : 'password'; }));
+}
+
+/* Protect */
+function toolProtect() {
+  const v = toolShell('protect');
+  const body = v.querySelector('.body');
+  singlePdf(body, async (file, bytes) => {
+    const state = await lockState(bytes);
+    if (state) { body.appendChild(h(`<p class="warn">${esc(t('alreadyLocked'))}</p>`)); return; }
+    const opts = h(`<div>
+        <div class="opts">${pwField('pw', t('password'))}${pwField('pw2', t('passwordAgain'))}</div>
+        <label class="check" style="margin-top:10px"><input type="checkbox" name="showpw"> ${esc(t('showPw'))}</label>
+        <p class="hint">${esc(t('protectHint'))}</p>
+        <div class="btn-row"><button class="btn primary" data-go>${esc(t('protectBtn'))}</button></div></div>`);
+    wireShowPw(opts);
+    opts.querySelector('[data-go]').addEventListener('click', () => run(v, async () => {
+      const pw = opts.querySelector('[name=pw]').value, pw2 = opts.querySelector('[name=pw2]').value;
+      if (!pw) throw new Error(t('pwEmpty'));
+      if (pw !== pw2) throw new Error(t('pwMismatch'));
+      const r = await runQpdf(bytes, ['--encrypt', `--user-password=${pw}`, `--owner-password=${pw}`, '--bits=256', '--', '@in', '@out']);
+      if (!r.out) throw new Error(t('genericError', { msg: r.errs || 'qpdf' }));
+      await showResult(v, [{ name: baseName(file.name) + '-protected.pdf', data: r.out }]);
+    }));
+    body.appendChild(opts);
+  });
+  return v;
+}
+
+/* Unlock */
+function toolUnlock() {
+  const v = toolShell('unlock');
+  const body = v.querySelector('.body');
+  singlePdf(body, async (file, bytes) => {
+    const state = await lockState(bytes);
+    if (!state) { body.appendChild(h(`<p class="hint">${esc(t('notLocked'))}</p>`)); return; }
+    const opts = h(`<div>
+        ${state === 'open'
+          ? `<p class="hint">${esc(t('needsPw'))}</p><div class="opts">${pwField('pw', t('password'))}</div>
+             <label class="check" style="margin-top:10px"><input type="checkbox" name="showpw"> ${esc(t('showPw'))}</label>`
+          : `<p class="hint">${esc(t('restrictedOnly'))}</p>`}
+        <div class="btn-row"><button class="btn primary" data-go>${esc(t('unlockBtn'))}</button></div></div>`);
+    wireShowPw(opts);
+    const go = () => run(v, async () => {
+      const pw = opts.querySelector('[name=pw]')?.value ?? '';
+      if (state === 'open' && !pw) throw new Error(t('pwEmpty'));
+      const r = await runQpdf(bytes, [`--password=${pw}`, '--decrypt', '@in', '@out']);
+      if (!r.out) throw new Error(state === 'open' || /password/i.test(r.errs) ? t('wrongPw') : t('genericError', { msg: r.errs || 'qpdf' }));
+      await showResult(v, [{ name: baseName(file.name) + '-unlocked.pdf', data: r.out }]);
+    });
+    opts.querySelector('[data-go]').addEventListener('click', go);
+    opts.querySelector('[name=pw]')?.addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+    body.appendChild(opts);
+  });
+  return v;
+}
+
+/* OCR */
+let tesseractLoaded = null;
+function toolOcr() {
+  const v = toolShell('ocr');
+  const body = v.querySelector('.body');
+  const accept = 'application/pdf,.pdf,image/*';
+  body.appendChild(dropZone({ accept, multiple: true, label: t('chooseOcr'), onFiles: async files => {
+    const pdf = files.find(f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name));
+    const imgs = pdf ? [] : files.filter(f => f.type.startsWith('image/'));
+    if (!pdf && !imgs.length) return;
+    let bytes = null, js = null;
+    await run(v, async () => {
+      if (pdf) {
+        bytes = await readBytes(pdf);
+        if (await lockState(bytes)) throw new Error(t('encrypted'));
+        js = await loadJs(bytes);
+      }
+    });
+    if (pdf && !js) return;
+    const count = js ? js.numPages : imgs.length;
+    body.innerHTML = '';
+    const list = h(`<div class="file-list" style="margin:0"><li style="list-style:none"><span class="name">${esc(pdf ? pdf.name : imgs.map(f => f.name).join(', '))}</span>
+        <span class="meta">${esc(t('pages', { n: count }))}</span><button class="btn small" data-change>${esc(t('change'))}</button></li></div>`);
+    list.querySelector('[data-change]').addEventListener('click', () => route(true));
+    const opts = h(`<div>
+        <div class="field" style="margin-top:14px"><span>${esc(t('ocrLangs'))}</span>
+          <div class="seg"><label><input type="checkbox" name="ara" checked>العربية</label><label><input type="checkbox" name="eng" checked>English</label></div></div>
+        <div class="field" style="margin-top:12px"><span>${esc(t('ocrOutput'))}</span>
+          ${seg('out', [['pdf', t('ocrSearchable')], ['txt', t('ocrText')]], 'pdf')}</div>
+        <p class="hint">${esc(t('ocrHint'))}</p>
+        <div class="btn-row"><button class="btn primary" data-go>${esc(t('ocrBtn'))}</button></div></div>`);
+    opts.querySelector('[data-go]').addEventListener('click', () => run(v, async () => {
+      const langs = ['ara', 'eng'].filter(l => opts.querySelector(`[name=${l}]`).checked);
+      if (!langs.length) throw new Error(t('ocrPickLang'));
+      const wantPdf = val(opts, 'out') === 'pdf';
+      await progress(t('ocrLoading'));
+      if (!tesseractLoaded) tesseractLoaded = loadScript(libUrl('tesseract/tesseract.min.js'));
+      await tesseractLoaded;
+      let pageNo = 0;
+      const worker = await window.Tesseract.createWorker(langs, 1, {
+        workerPath: libUrl('tesseract/worker.min.js'),
+        corePath: libUrl('tesseract/'),
+        langPath: libUrl('tessdata'),
+        gzip: true,
+        logger: m => {
+          if (m.status === 'recognizing text' && pageNo) busyText.textContent = `${t('ocrPage', { n: pageNo, total: count })} ${Math.round((m.progress || 0) * 100)}%`;
+          else if (/load/i.test(m.status || '')) busyText.textContent = t('ocrLoading') + (m.progress ? ` ${Math.round(m.progress * 100)}%` : '');
+        },
+      });
+      try {
+        const out = wantPdf ? (js ? await loadLib(bytes) : await PDFDocument.create()) : null;
+        const outPages = out && js ? out.getPages() : null;
+        const texts = [];
+        for (let i = 0; i < count; i++) {
+          pageNo = i + 1;
+          busyText.textContent = t('ocrPage', { n: pageNo, total: count });
+          let canvas, vw, vh;
+          if (js) { const r = await renderPage(js, i + 1, { scale: 300 / 72, maxSide: 3500 }); canvas = r.canvas; vw = r.width; vh = r.height; }
+          else { canvas = await imageToCanvas(imgs[i], 3500); vw = 595.28; vh = vw * canvas.height / canvas.width; }
+          const { data } = await worker.recognize(canvas, { pdfTextOnly: true }, { text: true, pdf: wantPdf });
+          texts.push(data.text || '');
+          if (wantPdf) {
+            const [layer] = await out.embedPdf(new Uint8Array(data.pdf));
+            let page;
+            if (js) page = outPages[i];
+            else {
+              const c2 = canvas; const ctx = c2.getContext('2d');
+              ctx.globalCompositeOperation = 'destination-over'; ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c2.width, c2.height);
+              const jpg = await out.embedJpg(new Uint8Array(await (await canvasBlob(c2, 'image/jpeg', 0.85)).arrayBuffer()));
+              page = out.addPage([vw, vh]);
+              page.drawImage(jpg, { x: 0, y: 0, width: vw, height: vh });
+            }
+            const box = visualBox(page);
+            drawImageVisual(page, box, layer, box.vw / 2, box.vh / 2, box.vw, box.vh);
+          }
+          canvas.width = canvas.height = 0;
+        }
+        const name = pdf ? baseName(pdf.name) : (imgs.length === 1 ? baseName(imgs[0].name) : 'scan');
+        const allText = texts.map((tx, i) => (count > 1 ? `--- ${t('page', { n: i + 1 })} ---\n` : '') + tx.trim()).join('\n\n');
+        const textBox = `<label class="field" style="margin-top:10px"><span>${esc(t('ocrFound'))}</span><textarea rows="8" readonly dir="auto" style="width:100%">${esc(allText)}</textarea></label>
+          <div class="btn-row"><button class="btn small" data-copy>${esc(t('copyText'))}</button></div>`;
+        if (wantPdf) await showResult(v, [{ name: name + '-ocr.pdf', data: await out.save() }], textBox);
+        else await showResult(v, [{ name: name + '.txt', data: new Blob(['﻿' + allText], { type: 'text/plain;charset=utf-8' }), type: 'text/plain' }], textBox);
+        const ta = v.querySelector('.result textarea');
+        v.querySelector('.result [data-copy]')?.addEventListener('click', e => {
+          navigator.clipboard?.writeText(ta.value).then(() => { e.target.textContent = t('copied'); }).catch(() => { ta.select(); });
+        });
+      } finally { await worker.terminate(); }
+    }));
+    body.appendChild(list); body.appendChild(opts);
+  } }));
+  return v;
+}
+
+/* Edit: add text and white-out boxes */
+function toolEdit() {
+  const v = toolShell('edit');
+  const body = v.querySelector('.body');
+  singlePdf(body, async (file, bytes) => {
+    const js = await loadJs(bytes);
+    const total = js.numPages;
+    const items = []; // {page, kind:'text'|'box', x, y (top-left, fraction), w, h (fraction, box only), text, size, color}
+    let current = 1, selected = null, vw = 1, vh = 1;
+    const ui = h(`<div style="margin-top:14px">
+        <div class="field"><span>${esc(t('editMode'))}</span>${seg('mode', [['text', t('modeText')], ['box', t('modeBox')]], 'text')}</div>
+        <div class="opts" data-p="text">
+          <label class="field" style="grid-column:1/-1"><span>${esc(t('yourText'))}</span><textarea name="text" rows="2" dir="auto"></textarea></label>
+          <label class="field"><span>${esc(t('fontSize'))}</span><input type="number" name="size" value="14" min="4" max="200"></label>
+          <label class="field"><span>${esc(t('color'))}</span><input type="color" name="tcolor" value="#000000"></label>
+        </div>
+        <div class="opts hidden" data-p="box">
+          <label class="field"><span>${esc(t('boxColor'))}</span><input type="color" name="bcolor" value="#ffffff"></label>
+        </div>
+        <p class="hint" data-hint></p>
+        <div class="pager"><button class="btn small" data-prev>${esc(t('prev'))}</button><span data-pn></span><button class="btn small" data-next>${esc(t('next'))}</button></div>
+        <div class="stage-wrap"><div class="stage"><img alt=""></div></div>
+        <div class="btn-row" style="justify-content:center"><button class="btn primary" data-save>${esc(t('save'))}</button></div>
+      </div>`);
+    body.appendChild(ui);
+    const stage = ui.querySelector('.stage'), stageImg = stage.querySelector('img');
+    const mode = () => val(ui, 'mode');
+    const syncMode = () => {
+      ui.querySelectorAll('[data-p]').forEach(n => n.classList.toggle('hidden', n.dataset.p !== mode()));
+      ui.querySelector('[data-hint]').textContent = t(mode() === 'text' ? 'editHintText' : 'editHintBox');
+    };
+    ui.addEventListener('change', e => { if (e.target.name === 'mode') { selected = null; syncMode(); drawItems(); } });
+    syncMode();
+
+    const textImg = it => textCanvas(it.text || ' ', { px: it.size, color: it.color, weight: '400', scale: 2 });
+    // live-edit the selected item
+    const field = n => ui.querySelector(`[name=${n}]`);
+    field('text').addEventListener('input', () => { if (selected?.kind === 'text') { selected.text = field('text').value; drawItems(); } });
+    field('size').addEventListener('input', () => { if (selected?.kind === 'text') { selected.size = Math.max(4, +field('size').value || 14); drawItems(); } });
+    field('tcolor').addEventListener('input', () => { if (selected?.kind === 'text') { selected.color = field('tcolor').value; drawItems(); } });
+    field('bcolor').addEventListener('input', () => { if (selected?.kind === 'box') { selected.color = field('bcolor').value; drawItems(); } });
+
+    const cache = new Map();
+    async function showPage(n) {
+      current = n; selected = null;
+      ui.querySelector('[data-pn]').textContent = `${n} / ${total}`;
+      ui.querySelector('[data-prev]').disabled = n <= 1;
+      ui.querySelector('[data-next]').disabled = n >= total;
+      if (!cache.has(n)) {
+        busy(true);
+        try {
+          const r = await renderPage(js, n, { width: Math.min(1400, Math.max(600, stage.parentElement.clientWidth * (window.devicePixelRatio || 1))) });
+          cache.set(n, { url: r.canvas.toDataURL('image/jpeg', 0.85), w: r.width, h: r.height });
+        } finally { busy(false); }
+      }
+      const c = cache.get(n); vw = c.w; vh = c.h; stageImg.src = c.url;
+      drawItems();
+    }
+    function select(it) {
+      selected = it;
+      if (it) {
+        const m = ui.querySelector(`[name=mode][value=${it.kind}]`); if (!m.checked) { m.checked = true; syncMode(); }
+        if (it.kind === 'text') { field('text').value = it.text; field('size').value = it.size; field('tcolor').value = it.color; }
+        else field('bcolor').value = it.color;
+      }
+      stage.querySelectorAll('.placed').forEach(n => n.classList.toggle('sel', n._it === it));
+    }
+    function drawItems() {
+      stage.querySelectorAll('.placed').forEach(n => n.remove());
+      for (const it of items.filter(i => i.page === current)) {
+        const el = h(`<div class="placed${it === selected ? ' sel' : ''}"><button class="x" type="button">×</button><span class="rs"></span></div>`);
+        el._it = it;
+        const layout = () => {
+          let w = it.w, hh = it.h;
+          if (it.kind === 'text') { const tc = textImg(it); w = tc.width / vw; hh = tc.height / vh; if (!el._img || el._txt !== it.text + it.size + it.color) { el._txt = it.text + it.size + it.color; el.querySelector('img')?.remove(); const im = document.createElement('img'); im.src = tc.canvas.toDataURL(); el.prepend(im); el._img = im; } }
+          else el.style.background = it.color;
+          el.style.left = it.x * 100 + '%'; el.style.top = it.y * 100 + '%';
+          el.style.width = w * 100 + '%'; el.style.height = hh * 100 + '%';
+        };
+        layout();
+        const x = el.querySelector('.x');
+        x.addEventListener('pointerdown', e => e.stopPropagation());
+        x.addEventListener('click', e => { e.stopPropagation(); items.splice(items.indexOf(it), 1); if (selected === it) selected = null; drawItems(); });
+        el.addEventListener('pointerdown', e => {
+          if (e.target.classList.contains('rs') || e.target.classList.contains('x')) return;
+          e.preventDefault(); e.stopPropagation(); el.setPointerCapture(e.pointerId); select(it);
+          const r = stage.getBoundingClientRect(); const sx = e.clientX, sy = e.clientY, ox = it.x, oy = it.y;
+          const mv = ev => { it.x = Math.min(0.98, Math.max(0, ox + (ev.clientX - sx) / r.width)); it.y = Math.min(0.98, Math.max(0, oy + (ev.clientY - sy) / r.height)); layout(); };
+          const up = () => { el.removeEventListener('pointermove', mv); el.removeEventListener('pointerup', up); el.removeEventListener('pointercancel', up); };
+          el.addEventListener('pointermove', mv); el.addEventListener('pointerup', up); el.addEventListener('pointercancel', up);
+        });
+        const rs = el.querySelector('.rs');
+        rs.addEventListener('pointerdown', e => {
+          e.preventDefault(); e.stopPropagation(); rs.setPointerCapture(e.pointerId); select(it);
+          const r = stage.getBoundingClientRect(); const sx = e.clientX, sy = e.clientY, ow = it.w, oh = it.h, os = it.size;
+          const mv = ev => {
+            const dx = (ev.clientX - sx) / r.width, dy = (ev.clientY - sy) / r.height;
+            if (it.kind === 'box') { it.w = Math.max(0.01, ow + dx); it.h = Math.max(0.005, oh + dy); }
+            else { it.size = Math.max(4, Math.round(os * (1 + dx * r.width / Math.max(40, el.offsetWidth)))); field('size').value = it.size; }
+            layout();
+          };
+          const up = () => { rs.removeEventListener('pointermove', mv); rs.removeEventListener('pointerup', up); rs.removeEventListener('pointercancel', up); };
+          rs.addEventListener('pointermove', mv); rs.addEventListener('pointerup', up); rs.addEventListener('pointercancel', up);
+        });
+        stage.appendChild(el);
+      }
+    }
+    stage.addEventListener('click', e => {
+      if (e.target !== stageImg) return;
+      const r = stage.getBoundingClientRect();
+      const fx = (e.clientX - r.left) / r.width, fy = (e.clientY - r.top) / r.height;
+      if (selected) { select(null); return; }
+      let it;
+      if (mode() === 'text') {
+        const text = field('text').value.trim() ? field('text').value : t('sampleText');
+        it = { page: current, kind: 'text', text, size: Math.max(4, +field('size').value || 14), color: field('tcolor').value, x: fx, y: Math.max(0, fy - 0.01) };
+      } else {
+        it = { page: current, kind: 'box', color: field('bcolor').value, w: 0.25, h: 0.03, x: Math.max(0, fx - 0.125), y: Math.max(0, fy - 0.015) };
+      }
+      items.push(it); selected = it; drawItems(); select(it);
+      if (it.kind === 'text' && it.text === t('sampleText')) { field('text').value = ''; field('text').placeholder = t('sampleText'); field('text').focus({ preventScroll: true }); }
+    });
+    ui.querySelector('[data-prev]').addEventListener('click', () => showPage(current - 1));
+    ui.querySelector('[data-next]').addEventListener('click', () => showPage(current + 1));
+    ui.querySelector('[data-save]').addEventListener('click', () => run(v, async () => {
+      if (!items.length) throw new Error(t('editNothing'));
+      const doc = await loadLib(bytes);
+      const pages = doc.getPages();
+      // boxes first so text can sit on top of them
+      for (const it of [...items].sort((a, b) => (a.kind === 'box' ? 0 : 1) - (b.kind === 'box' ? 0 : 1))) {
+        const page = pages[it.page - 1]; const box = visualBox(page);
+        if (it.kind === 'box') {
+          const w = it.w * box.vw, hh = it.h * box.vh;
+          const p = toUser(box, it.x * box.vw, box.vh - it.y * box.vh - hh);
+          page.drawRectangle({ x: p.x, y: p.y, width: w, height: hh, color: hexToRgb(it.color), rotate: degrees(box.rot) });
+        } else {
+          if (!it.text.trim()) continue;
+          const tc = textCanvas(it.text, { px: it.size, color: it.color, weight: '400', scale: 4 });
+          const img = await embedCanvasPng(doc, tc.canvas);
+          drawImageVisual(page, box, img, it.x * box.vw + tc.width / 2, box.vh - it.y * box.vh - tc.height / 2, tc.width, tc.height);
+        }
+      }
+      await showResult(v, [{ name: baseName(file.name) + '-edited.pdf', data: await doc.save() }]);
+    }));
+    showPage(1);
+  });
+  return v;
+}
+
+/* Fill forms */
+function toolForms() {
+  const v = toolShell('forms');
+  const body = v.querySelector('.body');
+  singlePdf(body, async (file, bytes) => {
+    const doc = await loadLib(bytes);
+    const fields = doc.getForm().getFields();
+    const L = window.PDFLib;
+    const kindOf = f => f instanceof L.PDFTextField ? 'TextField' : f instanceof L.PDFCheckBox ? 'CheckBox' : f instanceof L.PDFDropdown ? 'Dropdown'
+      : f instanceof L.PDFRadioGroup ? 'RadioGroup' : f instanceof L.PDFOptionList ? 'OptionList' : 'Other';
+    const usable = fields.filter(f => ['TextField', 'CheckBox', 'Dropdown', 'RadioGroup', 'OptionList'].includes(kindOf(f)) && !f.isReadOnly());
+    if (!usable.length) { body.appendChild(h(`<p class="hint">${esc(t('noFields'))} <a href="#edit">${esc(t('t_edit'))}</a></p>`)); return; }
+    const pretty = n => n.replace(/[._\[\]]+/g, ' ').replace(/\s+/g, ' ').trim();
+    const form = h(`<div><p class="hint">${esc(t('fieldsFound', { n: usable.length }))}</p><div class="opts"></div>
+        <label class="check" style="margin-top:12px"><input type="checkbox" name="flatten"> ${esc(t('flatten'))}</label>
+        <p class="hint">${esc(t('flattenHint'))}</p>
+        <div class="btn-row"><button class="btn primary" data-go>${esc(t('save'))}</button></div></div>`);
+    const grid = form.querySelector('.opts');
+    usable.forEach((f, i) => {
+      const k = kindOf(f), label = esc(pretty(f.getName()) || `#${i + 1}`);
+      let html;
+      if (k === 'TextField') html = f.isMultiline()
+        ? `<label class="field" style="grid-column:1/-1"><span>${label}</span><textarea data-i="${i}" rows="3" dir="auto">${esc(f.getText() || '')}</textarea></label>`
+        : `<label class="field"><span>${label}</span><input type="text" data-i="${i}" dir="auto" value="${esc(f.getText() || '')}"></label>`;
+      else if (k === 'CheckBox') html = `<label class="check field" style="flex-direction:row"><input type="checkbox" data-i="${i}" ${f.isChecked() ? 'checked' : ''}> ${label}</label>`;
+      else {
+        const sel = k === 'RadioGroup' ? f.getSelected() : (f.getSelected() || [])[0];
+        html = `<label class="field"><span>${label}</span><select data-i="${i}"><option value=""></option>${f.getOptions().map(o => `<option ${o === sel ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select></label>`;
+      }
+      grid.appendChild(h(html));
+    });
+    form.querySelector('[data-go]').addEventListener('click', () => run(v, async () => {
+      const work = await loadLib(bytes);
+      const wf = work.getForm();
+      const helv = await work.embedFont(StandardFonts.Helvetica);
+      const flatten = form.querySelector('[name=flatten]').checked;
+      const latin = s => /^[\x00-\xFF–—‘’“”€]*$/.test(s);
+      let needsViewerAppearance = false;
+      const afterFlatten = [];
+      for (const el of form.querySelectorAll('[data-i]')) {
+        const f = wf.getField(usable[+el.dataset.i].getName());
+        const k = kindOf(f);
+        if (k === 'TextField') {
+          const val2 = el.value;
+          if (latin(val2)) { f.setText(val2 || undefined); f.updateAppearances(helv); continue; }
+          if (flatten) {
+            // Draw non-Latin (e.g. Arabic) text as an image inside each widget box, then leave the field empty.
+            for (const w of f.acroField.getWidgets()) {
+              const page = wf.findWidgetPage(w); const r = w.getRectangle();
+              const fs = f.isMultiline() ? 11 : Math.min(14, r.height * 0.65);
+              const tc = textCanvas(val2, { px: fs, color: '#000', weight: '400', scale: 4 });
+              const s = Math.min(1, (r.width - 4) / tc.width, (r.height - 2) / tc.height);
+              const img = await embedCanvasPng(work, tc.canvas);
+              const w2 = tc.width * s, h2 = tc.height * s;
+              const rtl = hasArabic(val2);
+              afterFlatten.push(() => page.drawImage(img, { x: rtl ? r.x + r.width - w2 - 2 : r.x + 2, y: r.y + (r.height - h2) / 2, width: w2, height: h2 }));
+            }
+            f.setText(undefined); f.updateAppearances(helv);
+          } else { f.setText(val2); needsViewerAppearance = true; }
+        } else if (k === 'CheckBox') { el.checked ? f.check() : f.uncheck(); f.updateAppearances(); }
+        else if (k === 'RadioGroup') { if (el.value) f.select(el.value); else f.clear(); f.updateAppearances(); }
+        else { if (el.value) f.select(el.value); else f.clear(); f.updateAppearances(helv); }
+      }
+      if (flatten) { wf.flatten({ updateFieldAppearances: false }); afterFlatten.forEach(fn => fn()); }
+      if (needsViewerAppearance) wf.acroForm.dict.set(window.PDFLib.PDFName.of('NeedAppearances'), window.PDFLib.PDFBool.True);
+      await showResult(v, [{ name: baseName(file.name) + '-filled.pdf', data: await work.save({ updateFieldAppearances: false }) }]);
+    }));
+    body.appendChild(form);
   });
   return v;
 }
