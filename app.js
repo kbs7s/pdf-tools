@@ -200,6 +200,13 @@ const ICONS = {
   scan: ic('<path d="M3 8V6a2 2 0 0 1 2-2h2M17 4h2a2 2 0 0 1 2 2v2M21 16v2a2 2 0 0 1-2 2h-2M7 20H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3.5"/>'),
   crop: ic('<path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/>'),
   redact: ic('<rect x="3" y="5" width="18" height="14" rx="2"/><rect x="6" y="9" width="8" height="3" fill="currentColor"/><path d="M6 15h12"/>'),
+  view: ic('<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>'),
+  insert: ic('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M12 11v6M9 14h6"/>'),
+  extract: ic('<rect x="3" y="3" width="13" height="13" rx="2"/><circle cx="8" cy="8" r="1.5"/><path d="m16 11-3-3-7 7"/><path d="M21 8v11a2 2 0 0 1-2 2H8"/>'),
+  stamp: ic('<path d="M9 3h6l-1 7h3a2 2 0 0 1 2 2v3H5v-3a2 2 0 0 1 2-2h3z"/><path d="M5 19h14"/>'),
+  nup: ic('<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M12 5v14"/>'),
+  gray: ic('<circle cx="12" cy="12" r="9"/><path d="M12 3v18" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/>'),
+  repair: ic('<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/>'),
   upload: ic('<path d="M12 16V4"/><path d="m6 10 6-6 6 6"/><path d="M4 20h16"/>'),
 };
 
@@ -289,6 +296,7 @@ async function showResult(view, outputs, extraHtml = '') {
       </div></div>`);
   r.querySelector('[data-share]')?.addEventListener('click', () => navigator.share({ files: [file], title: file.name }).catch(() => {}));
   r.querySelector('[data-again]').addEventListener('click', () => route(true));
+  addContinue(r, file);
   box.appendChild(r);
   r.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
@@ -336,37 +344,33 @@ function singlePdf(body, onLoad) {
 
 /* ---------------- tools ---------------- */
 const TOOLS = [
+  { id: 'view', render: toolView },
   { id: 'merge', render: toolMerge },
   { id: 'split', render: toolSplit },
   { id: 'organize', render: toolOrganize },
   { id: 'rotate', render: toolOrganize },
   { id: 'delete', render: toolOrganize },
+  { id: 'insert', render: toolInsert },
   { id: 'compress', render: toolCompress },
   { id: 'crop', render: toolCrop },
-  { id: 'redact', render: toolRedact },
   { id: 'scan', render: toolScan },
   { id: 'img2pdf', render: toolImg2Pdf },
   { id: 'pdf2img', render: toolPdf2Img },
-  { id: 'numbers', render: toolNumbers },
-  { id: 'watermark', render: toolWatermark },
-  { id: 'sign', render: toolSign },
+  { id: 'extract', render: toolExtract },
+  { id: 'ocr', render: toolOcr },
   { id: 'edit', render: toolEdit },
   { id: 'forms', render: toolForms },
-  { id: 'ocr', render: toolOcr },
+  { id: 'sign', render: toolSign },
+  { id: 'stamp', render: toolStamp },
+  { id: 'numbers', render: toolNumbers },
+  { id: 'watermark', render: toolWatermark },
+  { id: 'nup', render: toolNup },
+  { id: 'gray', render: toolGray },
+  { id: 'redact', render: toolRedact },
   { id: 'protect', render: toolProtect },
   { id: 'unlock', render: toolUnlock },
+  { id: 'repair', render: toolRepair },
 ];
-
-function home() {
-  const v = h(`<section>
-      <div class="hero"><h1>${esc(t('heroTitle'))}</h1><p>${esc(t('heroSub'))}</p></div>
-      <div class="grid"></div></section>`);
-  const g = v.querySelector('.grid');
-  for (const tool of TOOLS) {
-    g.appendChild(h(`<a class="tool-card" href="#${tool.id}"><div class="ico">${ICONS[tool.id]}</div><b>${esc(t('t_' + tool.id))}</b><span>${esc(t('d_' + tool.id))}</span></a>`));
-  }
-  return v;
-}
 
 /* Merge */
 function toolMerge() {
@@ -1884,6 +1888,420 @@ if ('launchQueue' in window) {
   });
 }
 
+/* ---------------- home: search + recently used ---------------- */
+function getRecent() { try { return JSON.parse(localStorage.getItem('recent') || '[]').filter(id => TOOLS.some(x => x.id === id)); } catch { return []; } }
+function addRecent(id) { try { const r = [id, ...getRecent().filter(x => x !== id)].slice(0, 4); localStorage.setItem('recent', JSON.stringify(r)); } catch {} }
+const toolCard = id => h(`<a class="tool-card" href="#${id}" data-id="${id}"><div class="ico">${ICONS[id]}</div><b>${esc(t('t_' + id))}</b><span>${esc(t('d_' + id))}</span></a>`);
+const norm = s => String(s).toLowerCase().normalize('NFKC').replace(/[أإآ]/g, 'ا').replace(/ة/g, 'ه').replace(/ى/g, 'ي');
+function home() {
+  const v = h(`<section>
+      <div class="hero"><h1>${esc(t('heroTitle'))}</h1><p>${esc(t('heroSub'))}</p></div>
+      <input class="tool-search" type="search" placeholder="${esc(t('searchTools'))}" aria-label="${esc(t('searchTools'))}">
+      <div data-recent></div>
+      <div class="grid" data-all></div>
+      <p class="hint hidden" data-none>${esc(t('noToolsFound'))}</p></section>`);
+  const recent = getRecent();
+  if (recent.length) {
+    const r = h(`<div style="margin-bottom:16px"><h3 class="sec-title">${esc(t('recentTools'))}</h3><div class="grid"></div></div>`);
+    recent.forEach(id => r.querySelector('.grid').appendChild(toolCard(id)));
+    v.querySelector('[data-recent]').appendChild(r);
+  }
+  const g = v.querySelector('[data-all]');
+  for (const tool of TOOLS) g.appendChild(toolCard(tool.id));
+  const input = v.querySelector('.tool-search');
+  input.addEventListener('input', () => {
+    const q = norm(input.value.trim());
+    v.querySelector('[data-recent]').classList.toggle('hidden', !!q);
+    let shown = 0;
+    g.querySelectorAll('.tool-card').forEach(c => {
+      const id = c.dataset.id;
+      const hay = norm(['en', 'ar'].map(l => `${STRINGS[l]['t_' + id]} ${STRINGS[l]['d_' + id]}`).join(' ') + ' ' + id);
+      const ok = !q || q.split(/\s+/).every(w => hay.includes(w));
+      c.classList.toggle('hidden', !ok); if (ok) shown++;
+    });
+    v.querySelector('[data-none]').classList.toggle('hidden', shown > 0);
+  });
+  return v;
+}
+
+/* ---------------- "continue with another tool" ---------------- */
+function addContinue(resultEl, file) {
+  if (file.type !== 'application/pdf') return;
+  const row = resultEl.querySelector('.btn-row');
+  const btn = h(`<button class="btn" data-continue>${esc(t('continueWith'))}</button>`);
+  row.appendChild(btn);
+  btn.addEventListener('click', () => {
+    if (resultEl.querySelector('.continue-list')) { resultEl.querySelector('.continue-list').remove(); return; }
+    const list = h(`<div class="continue-list"><p class="hint">${esc(t('continueHint'))}</p><div class="chips"></div></div>`);
+    for (const tool of TOOLS) {
+      if (['img2pdf', 'scan'].includes(tool.id)) continue;
+      const c = h(`<button class="chip">${ICONS[tool.id].replace('<svg', '<svg width="16" height="16"')}<span>${esc(t('t_' + tool.id))}</span></button>`);
+      c.addEventListener('click', () => {
+        incomingFiles = [file];
+        if (location.hash.slice(1) === tool.id) route(true); else location.hash = tool.id;
+      });
+      list.querySelector('.chips').appendChild(c);
+    }
+    resultEl.appendChild(list);
+  });
+}
+
+/* ---------------- Read PDF (viewer with search) ---------------- */
+function toolView() {
+  const v = toolShell('view');
+  const body = v.querySelector('.body');
+  singlePdf(body, async (file, bytes) => {
+    const js = await loadJs(bytes);
+    const total = js.numPages;
+    const ui = h(`<div style="margin-top:12px">
+        <div class="search-row"><input type="search" name="q" placeholder="${esc(t('searchInPdf'))}" dir="auto"><button class="btn" data-find>${esc(t('find'))}</button></div>
+        <div class="search-results hidden"></div>
+        <div class="btn-row"><button class="btn small" data-zoom="-1">−</button><span data-zl style="align-self:center">100%</span><button class="btn small" data-zoom="1">+</button>
+          <span class="hint" style="align-self:center;margin:0">${esc(t('pages', { n: total }))}</span></div>
+        <div class="reader"></div></div>`);
+    body.appendChild(ui);
+    const reader = ui.querySelector('.reader');
+    let zoom = 1;
+    const sizes = [];
+    for (let i = 1; i <= total; i++) { const pg = await js.getPage(i); const vp = pg.getViewport({ scale: 1 }); sizes.push([vp.width, vp.height]); }
+    const rendered = new Map();
+    const io = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) renderInto(e.target); }), { rootMargin: '600px' });
+    let queue = Promise.resolve();
+    function renderInto(el) {
+      const n = +el.dataset.p; const want = Math.round(el.clientWidth * Math.min(2, window.devicePixelRatio || 1));
+      if ((rendered.get(n) || 0) >= want) return;
+      rendered.set(n, want);
+      queue = queue.then(async () => { const { canvas } = await renderPage(js, n, { width: want }); el.querySelector('img').src = canvas.toDataURL('image/jpeg', 0.85); }).catch(console.error);
+    }
+    function layout() {
+      reader.innerHTML = '';
+      reader.style.setProperty('--zoom', zoom);
+      ui.querySelector('[data-zl]').textContent = Math.round(zoom * 100) + '%';
+      rendered.clear();
+      sizes.forEach(([w, hh], i) => {
+        const el = h(`<div class="rpage" data-p="${i + 1}" style="aspect-ratio:${w}/${hh}"><img alt=""><span class="num">${i + 1}</span></div>`);
+        reader.appendChild(el); io.observe(el);
+      });
+    }
+    ui.querySelectorAll('[data-zoom]').forEach(b => b.addEventListener('click', () => { zoom = Math.min(3, Math.max(0.5, zoom + 0.25 * +b.dataset.zoom)); layout(); }));
+    let texts = null;
+    async function find() {
+      const q = norm(ui.querySelector('[name=q]').value.trim());
+      const box = ui.querySelector('.search-results');
+      if (!q) { box.classList.add('hidden'); return; }
+      busy(true);
+      try {
+        if (!texts) { texts = []; for (let i = 1; i <= total; i++) { await progress(t('processingPage', { n: i, total })); const tc = await (await js.getPage(i)).getTextContent(); texts.push(tc.items.map(it => it.str + (it.hasEOL ? '\n' : ' ')).join('')); } }
+      } finally { busy(false); }
+      const hits = [];
+      texts.forEach((tx, i) => {
+        const n = norm(tx); let k = n.indexOf(q);
+        while (k >= 0 && hits.length < 200) { hits.push({ page: i + 1, snip: tx.slice(Math.max(0, k - 30), k + q.length + 30).replace(/\s+/g, ' ') }); k = n.indexOf(q, k + q.length); }
+      });
+      box.classList.remove('hidden'); box.innerHTML = '';
+      box.appendChild(h(`<p class="hint" style="margin:0 0 6px">${esc(hits.length ? t('foundN', { n: hits.length }) : t('notFound'))}</p>`));
+      hits.forEach(hit => {
+        const b = h(`<button class="hit"><b>${esc(t('page', { n: hit.page }))}</b> <span dir="auto">…${esc(hit.snip)}…</span></button>`);
+        b.addEventListener('click', () => {
+          const el = reader.querySelector(`[data-p="${hit.page}"]`); el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          reader.querySelectorAll('.rpage.hl').forEach(x => x.classList.remove('hl')); el.classList.add('hl');
+        });
+        box.appendChild(b);
+      });
+    }
+    ui.querySelector('[data-find]').addEventListener('click', find);
+    ui.querySelector('[name=q]').addEventListener('keydown', e => { if (e.key === 'Enter') find(); });
+    layout();
+  });
+  return v;
+}
+
+/* Draw an embedded page into a cell, keeping its on-screen orientation. */
+function drawEmbeddedFit(page, emb, rot, cx, cy, cw, ch) {
+  rot = ((rot % 360) + 360) % 360;
+  const swap = rot === 90 || rot === 270;
+  const vw = swap ? emb.height : emb.width, vh = swap ? emb.width : emb.height;
+  const s = Math.min(cw / vw, ch / vh); const dw = vw * s, dh = vh * s;
+  const left = cx - dw / 2, right = cx + dw / 2, bottom = cy - dh / 2, top = cy + dh / 2;
+  const [x, y] = rot === 90 ? [left, top] : rot === 180 ? [right, top] : rot === 270 ? [right, bottom] : [left, bottom];
+  page.drawPage(emb, { x, y, width: emb.width * s, height: emb.height * s, rotate: degrees(-rot) });
+}
+
+/* Pages per sheet / booklet */
+function toolNup() {
+  const v = toolShell('nup');
+  const body = v.querySelector('.body');
+  singlePdf(body, async (file, bytes) => {
+    const src = await loadLib(bytes);
+    const opts = h(`<div>
+        <p class="hint">${esc(t('pages', { n: src.getPageCount() }))}</p>
+        <div class="field" style="margin-top:12px"><span>${esc(t('layout'))}</span>${seg('mode', [['2', t('nup2')], ['4', t('nup4')], ['booklet', t('booklet')]], '2')}</div>
+        <div class="opts">
+          <div class="field"><span>${esc(t('pageSize'))}</span>${seg('paper', [['a4', 'A4'], ['letter', 'Letter']], 'a4')}</div>
+        </div>
+        <label class="check" style="margin-top:12px"><input type="checkbox" name="lines"> ${esc(t('drawLines'))}</label>
+        <label class="check" style="margin-top:8px" data-rtl><input type="checkbox" name="rtl" ${lang === 'ar' ? 'checked' : ''}> ${esc(t('rtlBinding'))}</label>
+        <p class="hint" data-bhint>${esc(t('bookletHint'))}</p>
+        <div class="btn-row"><button class="btn primary" data-go>${esc(t('makePdf'))}</button></div></div>`);
+    const sync = () => { const b = val(opts, 'mode') === 'booklet'; opts.querySelector('[data-bhint]').classList.toggle('hidden', !b); };
+    opts.addEventListener('change', sync); sync();
+    opts.querySelector('[data-go]').addEventListener('click', () => run(v, async () => {
+      const mode = val(opts, 'mode'), rtl = opts.querySelector('[name=rtl]').checked, lines = opts.querySelector('[name=lines]').checked;
+      let [W, H] = val(opts, 'paper') === 'a4' ? [595.28, 841.89] : [612, 792];
+      const out = await PDFDocument.create();
+      const srcPages = src.getPages();
+      const embs = await out.embedPages(srcPages);
+      const rots = srcPages.map(p => p.getRotation().angle);
+      let order = srcPages.map((_, i) => i);
+      let per = mode === '4' ? 4 : 2;
+      if (mode === 'booklet') {
+        const n = Math.ceil(order.length / 4) * 4; const seq = [];
+        for (let i = 0; i < n / 4; i++) seq.push(n - 1 - 2 * i, 2 * i, 2 * i + 1, n - 2 - 2 * i);
+        order = seq.map(i => (i < srcPages.length ? i : -1));
+      }
+      if (per === 2) [W, H] = [H, W];
+      const cells = per === 2 ? [[0, 0], [1, 0]] : [[0, 0], [1, 0], [0, 1], [1, 1]];
+      const cols = 2, rows = per === 2 ? 1 : 2, m = 14;
+      const cw = W / cols, ch = H / rows;
+      for (let s = 0; s < order.length; s += per) {
+        await progress(t('processingPage', { n: s / per + 1, total: Math.ceil(order.length / per) }));
+        const sheet = out.addPage([W, H]);
+        cells.forEach(([c, r], k) => {
+          const idx = order[s + k]; const col = rtl ? cols - 1 - c : c;
+          if (idx === undefined || idx < 0) return;
+          drawEmbeddedFit(sheet, embs[idx], rots[idx], col * cw + cw / 2, H - (r * ch + ch / 2), cw - 2 * m, ch - 2 * m);
+        });
+        if (lines) {
+          sheet.drawLine({ start: { x: W / 2, y: 0 }, end: { x: W / 2, y: H }, thickness: 0.5, color: rgb(0.6, 0.6, 0.6), dashArray: [4, 4] });
+          if (rows === 2) sheet.drawLine({ start: { x: 0, y: H / 2 }, end: { x: W, y: H / 2 }, thickness: 0.5, color: rgb(0.6, 0.6, 0.6), dashArray: [4, 4] });
+        }
+      }
+      await showResult(v, [{ name: baseName(file.name) + (mode === 'booklet' ? '-booklet.pdf' : `-${per}up.pdf`), data: await out.save() }],
+        mode === 'booklet' ? `<p class="hint">${esc(t('bookletPrint'))}</p>` : '');
+    }));
+    body.appendChild(opts);
+  });
+  return v;
+}
+
+/* Add image or stamp */
+function toolStamp() {
+  const v = toolShell('stamp');
+  const body = v.querySelector('.body');
+  singlePdf(body, async (file, bytes) => {
+    const js = await loadJs(bytes);
+    let pic = null; // {canvas, aspect, url}
+    const r = { x: 0.6, y: 0.75, w: 0.3, h: 0.1 };
+    const ui = h(`<div style="margin-top:14px">
+        <label class="btn primary">${esc(t('chooseStamp'))}<input type="file" accept="image/*" hidden name="pic"></label>
+        <div data-rest class="hidden">
+          <label class="check" style="margin-top:10px"><input type="checkbox" name="nowhite"> ${esc(t('removeWhite'))}</label>
+          <div class="opts">
+            <div class="field"><span>${esc(t('applyTo'))}</span>${seg('scope', [['all', t('allPages')], ['this', t('thisPage')]], 'all')}</div>
+            <label class="field"><span>${esc(t('opacity'))} <output>100%</output></span><input type="range" name="op" min="10" max="100" value="100"></label>
+          </div>
+          <p class="hint">${esc(t('stampHint'))}</p>
+          ${pagerHtml()}
+          <div class="btn-row" style="justify-content:center"><button class="btn primary" data-save>${esc(t('save'))}</button></div>
+        </div></div>`);
+    body.appendChild(ui);
+    let raw = null;
+    const el = h(`<div class="placed stamp"><img alt=""><span class="hd" data-h="br"></span></div>`);
+    const view = pageViewer(ui, js, () => fit());
+    const pageAspect = () => view.w / view.h;
+    function fit() { if (!pic) return; r.h = Math.min(1, r.w * pageAspect() / pic.aspect); r.x = Math.min(1 - r.w, r.x); r.y = Math.max(0, Math.min(1 - r.h, r.y)); placeRect(el, r); el.style.opacity = val(ui, 'op') / 100; }
+    rectDrag(el, view.stage, r, () => { r.w = Math.min(r.w, 1 - r.x); fit(); });
+    function makePic() {
+      const c = document.createElement('canvas'); c.width = raw.width; c.height = raw.height; const ctx = c.getContext('2d'); ctx.drawImage(raw, 0, 0);
+      if (ui.querySelector('[name=nowhite]').checked) {
+        const d = ctx.getImageData(0, 0, c.width, c.height);
+        for (let i = 0; i < d.data.length; i += 4) { const mn = Math.min(d.data[i], d.data[i + 1], d.data[i + 2]); if (mn > 225) d.data[i + 3] = 0; else if (mn > 180) d.data[i + 3] = Math.round(255 * (225 - mn) / 45); }
+        ctx.putImageData(d, 0, 0);
+      }
+      pic = { canvas: c, aspect: c.width / c.height, url: c.toDataURL('image/png') };
+      el.querySelector('img').src = pic.url;
+    }
+    ui.querySelector('[name=pic]').addEventListener('change', async e => {
+      const f = e.target.files[0]; if (!f) return;
+      await run(v, async () => { raw = await imageToCanvas(f, 1600); makePic(); });
+      if (!pic) return;
+      ui.querySelector('[data-rest]').classList.remove('hidden');
+      if (!el.isConnected) { view.stage.appendChild(el); await view.show(1); }
+      fit();
+    });
+    ui.querySelector('[name=nowhite]').addEventListener('change', () => { if (raw) { makePic(); fit(); } });
+    ui.querySelector('[name=op]').addEventListener('input', e => { e.target.parentElement.querySelector('output').textContent = e.target.value + '%'; fit(); });
+    ui.querySelector('[data-save]').addEventListener('click', () => run(v, async () => {
+      const doc = await loadLib(bytes); const img = await embedCanvasPng(doc, pic.canvas);
+      const pages = doc.getPages(); const targets = val(ui, 'scope') === 'all' ? pages : [pages[view.current - 1]];
+      const op = val(ui, 'op') / 100;
+      for (const p of targets) {
+        const box = visualBox(p); const w = r.w * box.vw, hh = w / pic.aspect;
+        drawImageVisual(p, box, img, r.x * box.vw + w / 2, box.vh - r.y * box.vh - hh / 2, w, hh, 0, op);
+      }
+      await showResult(v, [{ name: baseName(file.name) + '-stamped.pdf', data: await doc.save() }]);
+    }));
+  });
+  return v;
+}
+
+/* Insert pages */
+function toolInsert() {
+  const v = toolShell('insert');
+  const body = v.querySelector('.body');
+  singlePdf(body, async (file, bytes) => {
+    const doc0 = await loadLib(bytes); const n = doc0.getPageCount();
+    let other = null;
+    const opts = h(`<div>
+        <p class="hint">${esc(t('pages', { n }))}</p>
+        <div class="field" style="margin-top:12px"><span>${esc(t('insertWhat'))}</span>${seg('what', [['blank', t('insBlank')], ['pdf', t('insPdf')]], 'blank')}</div>
+        <div class="opts">
+          <label class="field" data-for="blank"><span>${esc(t('howMany'))}</span><input type="number" name="count" value="1" min="1" max="100"></label>
+          <div class="field hidden" data-for="pdf"><span>${esc(t('otherPdf'))}</span><label class="btn">${esc(t('chooseFile'))}<input type="file" accept="application/pdf,.pdf" hidden name="other"></label><small class="hint" data-oname></small></div>
+          <label class="field"><span>${esc(t('where'))}</span><select name="pos">
+            <option value="0">${esc(t('atStart'))}</option>
+            ${Array.from({ length: n }, (_, i) => `<option value="${i + 1}" ${i === n - 1 ? 'selected' : ''}>${esc(i === n - 1 ? t('atEnd') : t('afterPage', { n: i + 1 }))}</option>`).join('')}
+          </select></label>
+        </div>
+        <div class="btn-row"><button class="btn primary" data-go>${esc(t('insertBtn'))}</button></div></div>`);
+    const sync = () => opts.querySelectorAll('[data-for]').forEach(x => x.classList.toggle('hidden', x.dataset.for !== val(opts, 'what')));
+    opts.addEventListener('change', e => { if (e.target.name === 'what') sync(); }); sync();
+    opts.querySelector('[name=other]').addEventListener('change', async e => {
+      const f = e.target.files[0]; if (!f) return;
+      await run(v, async () => { const ob = await readBytes(f); const od = await loadLib(ob); other = od; opts.querySelector('[data-oname]').textContent = `${f.name} · ${t('pages', { n: od.getPageCount() })}`; });
+    });
+    opts.querySelector('[data-go]').addEventListener('click', () => run(v, async () => {
+      const doc = await loadLib(bytes); const pos = +opts.querySelector('[name=pos]').value;
+      if (val(opts, 'what') === 'blank') {
+        const ref = doc.getPage(Math.max(0, Math.min(n - 1, pos - 1))); const { width, height } = ref.getSize();
+        const count = Math.max(1, Math.min(100, +val(opts, 'count') || 1));
+        for (let i = 0; i < count; i++) doc.insertPage(pos + i, [width, height]);
+      } else {
+        if (!other) throw new Error(t('pickOtherPdf'));
+        const copied = await doc.copyPages(other, other.getPageIndices());
+        copied.forEach((p, i) => doc.insertPage(pos + i, p));
+      }
+      await showResult(v, [{ name: baseName(file.name) + '-inserted.pdf', data: await doc.save() }]);
+    }));
+    body.appendChild(opts);
+  });
+  return v;
+}
+
+/* Extract images */
+function toolExtract() {
+  const v = toolShell('extract');
+  const body = v.querySelector('.body');
+  singlePdf(body, async (file, bytes) => {
+    const name = baseName(file.name); v.zipName = name + '-images.zip';
+    const row = h(`<div class="btn-row"><button class="btn primary" data-go>${esc(t('extractBtn'))}</button></div>`);
+    row.querySelector('[data-go]').addEventListener('click', () => run(v, async () => {
+      const L = window.PDFLib; const { PDFName, PDFRawStream, PDFArray, PDFNumber } = L; const N = k => PDFName.of(k);
+      const num = o => (o instanceof PDFNumber ? o.asNumber() : 0);
+      const doc = await loadLib(bytes); const outs = []; let k = 0;
+      for (const [, obj] of doc.context.enumerateIndirectObjects()) {
+        if (!(obj instanceof PDFRawStream)) continue; const d = obj.dict;
+        if (String(d.get(N('Subtype'))) !== '/Image' || d.get(N('ImageMask'))) continue;
+        const w = num(d.lookup(N('Width'))), hgt = num(d.lookup(N('Height')));
+        if (w < 32 || hgt < 32) continue;
+        let f = d.lookup(N('Filter')); if (f instanceof PDFArray) f = f.size() === 1 ? f.lookup(0) : null; const filter = f ? String(f) : '';
+        k++; if (k % 5 === 0) await progress(t('foundN', { n: outs.length }));
+        if (filter === '/DCTDecode') { outs.push({ name: `${name}-image-${outs.length + 1}.jpg`, data: obj.contents.slice(), type: 'image/jpeg' }); continue; }
+        if (filter !== '/FlateDecode' || num(d.lookup(N('BitsPerComponent'))) !== 8) continue;
+        const dp = d.lookup(N('DecodeParms')); if (dp && num(dp.lookup?.(N('Predictor'))) > 1) continue;
+        let cs = d.lookup(N('ColorSpace')), comps = 0;
+        if (cs instanceof PDFName) comps = { '/DeviceRGB': 3, '/DeviceGray': 1 }[String(cs)] || 0;
+        else if (cs instanceof PDFArray && String(cs.lookup(0)) === '/ICCBased') { const s = cs.lookup(1); comps = s && s.dict ? num(s.dict.lookup(N('N'))) : 0; }
+        if (comps !== 1 && comps !== 3) continue;
+        try {
+          const raw = await inflate(obj.contents); if (raw.length < w * hgt * comps) continue;
+          const id = new ImageData(w, hgt);
+          for (let i = 0, j = 0; i < w * hgt; i++, j += comps) { const o = i * 4; if (comps === 3) { id.data[o] = raw[j]; id.data[o + 1] = raw[j + 1]; id.data[o + 2] = raw[j + 2]; } else id.data[o] = id.data[o + 1] = id.data[o + 2] = raw[j]; id.data[o + 3] = 255; }
+          const c = document.createElement('canvas'); c.width = w; c.height = hgt; c.getContext('2d').putImageData(id, 0, 0);
+          outs.push({ name: `${name}-image-${outs.length + 1}.png`, data: await canvasBlob(c, 'image/png'), type: 'image/png' });
+          c.width = c.height = 0;
+        } catch {}
+      }
+      if (!outs.length) throw new Error(t('noImages'));
+      await showResult(v, outs, `<p class="hint">${esc(t('foundN', { n: outs.length }))}</p>`);
+    }));
+    body.appendChild(row);
+  });
+  return v;
+}
+
+/* Black & white */
+function toolGray() {
+  const v = toolShell('gray');
+  const body = v.querySelector('.body');
+  singlePdf(body, async (file, bytes) => {
+    const js = await loadJs(bytes);
+    const opts = h(`<div>
+        <p class="hint">${esc(t('pages', { n: js.numPages }))}</p>
+        <div class="field" style="margin-top:12px"><span>${esc(t('quality'))}</span>${seg('q', [['150', t('qNormal')], ['200', t('qHigh2')]], '150')}</div>
+        <p class="warn">${esc(t('grayNote'))}</p>
+        <div class="btn-row"><button class="btn primary" data-go>${esc(t('grayBtn'))}</button></div></div>`);
+    opts.querySelector('[data-go]').addEventListener('click', () => run(v, async () => {
+      const dpi = +val(opts, 'q'); const out = await PDFDocument.create();
+      for (let i = 1; i <= js.numPages; i++) {
+        await progress(t('processingPage', { n: i, total: js.numPages }));
+        const { canvas, width, height } = await renderPage(js, i, { scale: dpi / 72, maxSide: 3000 });
+        const ctx = canvas.getContext('2d'); const d = ctx.getImageData(0, 0, canvas.width, canvas.height); const p = d.data;
+        for (let k = 0; k < p.length; k += 4) p[k] = p[k + 1] = p[k + 2] = p[k] * 0.3 + p[k + 1] * 0.59 + p[k + 2] * 0.11;
+        ctx.putImageData(d, 0, 0);
+        const img = await out.embedJpg(new Uint8Array(await (await canvasBlob(canvas, 'image/jpeg', 0.8)).arrayBuffer()));
+        canvas.width = canvas.height = 0;
+        out.addPage([width, height]).drawImage(img, { x: 0, y: 0, width, height });
+      }
+      await showResult(v, [{ name: baseName(file.name) + '-bw.pdf', data: await out.save() }]);
+    }));
+    body.appendChild(opts);
+  });
+  return v;
+}
+
+/* Repair */
+function toolRepair() {
+  const v = toolShell('repair');
+  const body = v.querySelector('.body');
+  singlePdf(body, async (file, bytes) => {
+    const row = h(`<div><p class="hint">${esc(t('repairHint'))}</p><div class="btn-row"><button class="btn primary" data-go>${esc(t('repairBtn'))}</button></div></div>`);
+    row.querySelector('[data-go]').addEventListener('click', () => run(v, async () => {
+      await progress(t('working'));
+      const r = await runQpdf(bytes, ['--object-streams=generate', '@in', '@out']);
+      let data = null, how = 'repairOk';
+      if (r.out) { try { await PDFDocument.load(r.out); data = r.out; } catch (e) { if (/encrypt/i.test(String(e && e.message))) throw new Error(t('encrypted')); } }
+      if (!data) {
+        // Second try: pdf-lib reads objects one by one without trusting the cross-reference table, then writes a clean file.
+        try {
+          const d = await PDFDocument.load(bytes, { throwOnInvalidObject: false, updateMetadata: false });
+          if (d.getPageCount() > 0) { const out = await d.save(); const chk = await pdfjsLib.getDocument({ data: out.slice(), isEvalSupported: false }).promise; await (await chk.getPage(1)).getOperatorList(); chk.destroy(); data = out; }
+        } catch (e) { if (/encrypt/i.test(String(e && e.message))) throw new Error(t('encrypted')); }
+      }
+      if (!data) {
+        // Last resort: if the pages can still be drawn, rebuild the file from page images.
+        let js;
+        try { js = await pdfjsLib.getDocument({ data: bytes.slice(), isEvalSupported: false }).promise; }
+        catch (e) { if (e && e.name === 'PasswordException') throw new Error(t('encrypted')); throw new Error(t('repairFail')); }
+        const out = await PDFDocument.create();
+        for (let i = 1; i <= js.numPages; i++) {
+          await progress(t('processingPage', { n: i, total: js.numPages }));
+          try {
+            const { canvas, width, height } = await renderPage(js, i, { scale: 2, maxSide: 3000 });
+            const img = await out.embedJpg(new Uint8Array(await (await canvasBlob(canvas, 'image/jpeg', 0.85)).arrayBuffer()));
+            out.addPage([width, height]).drawImage(img, { x: 0, y: 0, width, height });
+          } catch {}
+        }
+        if (!out.getPageCount()) throw new Error(t('repairFail'));
+        data = await out.save(); how = 'repairImages';
+      }
+      await showResult(v, [{ name: baseName(file.name) + '-repaired.pdf', data }], `<p class="hint">${esc(t(how))}</p>`);
+    }));
+    body.appendChild(row);
+  });
+  return v;
+}
+
 /* ---------------- router ---------------- */
 let lastHash = null;
 function route(force) {
@@ -1894,7 +2312,7 @@ function route(force) {
   $app.innerHTML = '';
   const view = tool ? tool.render(tool.id) : id === 'shared' ? sharedView() : home();
   $app.appendChild(view);
-  if (tool) feedIncoming(view);
+  if (tool) { addRecent(tool.id); feedIncoming(view); }
   window.scrollTo(0, 0);
 }
 window.addEventListener('hashchange', () => route());

@@ -1,5 +1,5 @@
 // Offline support: serve from cache, refresh the cache in the background.
-const CACHE = 'pdf-tools-v3';
+const CACHE = 'pdf-tools-v4';
 const FILES = ['./', 'index.html', 'style.css', 'app.js', 'i18n.js', 'icon.svg', 'icon-192.png', 'manifest.webmanifest',
   'lib/pdf-lib.min.js', 'lib/jszip.min.js', 'lib/pdf.min.mjs', 'lib/pdf.worker.min.mjs'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)).then(() => self.skipWaiting())); });
