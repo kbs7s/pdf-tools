@@ -45,4 +45,12 @@ A plain static site, no build step. It uses:
 - [qpdf](https://qpdf.sourceforge.io/) compiled to WebAssembly ([qpdf-wasm](https://github.com/neslinesli93/qpdf-wasm)) for password protection
 
 The libraries are copied into `lib/` so the site has no outside dependencies.
-To run it locally, serve the folder with any static web server (for example `python3 -m http.server`) and open it in a browser.
+## Offline and My files
+
+- After the first visit the site works with no internet. It downloads every engine once (about 17 MB, including OCR and password tools) and keeps it on the device. The home page shows when it is ready.
+- It can be installed as an app (Install app button on Android and desktop; on iPhone use Share, then Add to Home Screen).
+- Finished files are saved in **My files** on the device (IndexedDB, up to about 400 MB, oldest removed first). You can open them again, download them, use them in another tool, or turn saving off. Nothing is uploaded.
+
+## Run it on your own computer
+
+Download the repository (Code, then Download ZIP), unzip it, open a terminal in the folder and run `python3 -m http.server 8000`, then open http://localhost:8000. Opening index.html directly (file://) does not work, because browsers block the engines there.

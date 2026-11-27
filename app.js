@@ -298,6 +298,9 @@ async function showResult(view, outputs, extraHtml = '') {
   r.querySelector('[data-again]').addEventListener('click', () => route(true));
   addContinue(r, file);
   box.appendChild(r);
+  if (saveEnabled()) saveLocal(file, location.hash.slice(1)).then(ok => {
+    if (ok && r.isConnected) r.querySelector('.btn-row').before(h(`<p class="hint" style="margin:0 0 8px"><a href="#files">${esc(t('savedNote'))}</a></p>`));
+  });
   r.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
@@ -1100,6 +1103,7 @@ function toolOcr() {
       const worker = await window.Tesseract.createWorker(langs, 1, {
         workerPath: libUrl('tesseract/worker.min.js'),
         corePath: libUrl('tesseract/'),
+        workerBlobURL: false, // load the worker from our own files so it also works offline
         langPath: libUrl('tessdata'),
         gzip: true,
         logger: m => {
@@ -1846,6 +1850,7 @@ function toolRedact() {
 
 /* Files shared into the app (Android share sheet, or "Open with" on desktop) */
 let incomingFiles = null;
+let incomingFrom = null;
 async function readSharedFiles() {
   try {
     const cache = await caches.open('shared-files');
@@ -1859,13 +1864,14 @@ async function readSharedFiles() {
   } catch { return []; }
 }
 function sharedView() {
-  const v = h(`<section><div class="tool-head"><a class="back" href="#">${lang === 'ar' ? '→' : '←'} ${esc(t('back'))}</a><h2>${esc(t('sharedTitle'))}</h2></div>
+  const fromFiles = incomingFrom === 'files'; incomingFrom = null;
+  const v = h(`<section><div class="tool-head"><a class="back" href="#${fromFiles ? 'files' : ''}">${lang === 'ar' ? '→' : '←'} ${esc(t('back'))}</a><h2>${esc(t(fromFiles ? 'myFiles' : 'sharedTitle'))}</h2></div>
       <p class="tool-desc" data-names></p><div class="grid"></div></section>`);
   (async () => {
     if (!incomingFiles || !incomingFiles.length) incomingFiles = await readSharedFiles();
     const files = incomingFiles || [];
     if (!files.length) { v.querySelector('[data-names]').textContent = t('sharedNone'); return; }
-    v.querySelector('[data-names]').textContent = t('sharedPick', { names: files.map(f => f.name).join(', ') });
+    v.querySelector('[data-names]').textContent = t(fromFiles ? 'filesPick' : 'sharedPick', { names: files.map(f => f.name).join(', ') });
     const isPdf = files.some(f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name));
     const ids = isPdf ? TOOLS.map(x => x.id).filter(id => !['img2pdf', 'scan'].includes(id)) : ['img2pdf', 'scan', 'ocr'];
     const g = v.querySelector('.grid');
@@ -1896,6 +1902,7 @@ const norm = s => String(s).toLowerCase().normalize('NFKC').replace(/[أإآ]/g,
 function home() {
   const v = h(`<section>
       <div class="hero"><h1>${esc(t('heroTitle'))}</h1><p>${esc(t('heroSub'))}</p></div>
+      <div data-off></div>
       <input class="tool-search" type="search" placeholder="${esc(t('searchTools'))}" aria-label="${esc(t('searchTools'))}">
       <div data-recent></div>
       <div class="grid" data-all></div>
@@ -1906,6 +1913,7 @@ function home() {
     recent.forEach(id => r.querySelector('.grid').appendChild(toolCard(id)));
     v.querySelector('[data-recent]').appendChild(r);
   }
+  renderOffline(v.querySelector('[data-off]'));
   const g = v.querySelector('[data-all]');
   for (const tool of TOOLS) g.appendChild(toolCard(tool.id));
   const input = v.querySelector('.tool-search');
@@ -2302,6 +2310,124 @@ function toolRepair() {
   return v;
 }
 
+
+/* ---------------- My files: finished files kept on this device (IndexedDB) ---------------- */
+const FILES_CAP = 400 * 1048576; // keep at most ~400 MB; the oldest files are removed first
+function saveEnabled() { try { return localStorage.getItem('saveFiles') !== 'off'; } catch { return true; } }
+let dbP = null;
+function openDb() {
+  return dbP ||= new Promise((res, rej) => {
+    const r = indexedDB.open('pdf-tools', 1);
+    r.onupgradeneeded = () => { r.result.createObjectStore('meta', { keyPath: 'id', autoIncrement: true }); r.result.createObjectStore('data'); };
+    r.onsuccess = () => res(r.result); r.onerror = () => { dbP = null; rej(r.error); };
+  });
+}
+const idb = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+async function tx(mode, fn) {
+  const db = await openDb(); const t_ = db.transaction(['meta', 'data'], mode);
+  const out = await fn(t_.objectStore('meta'), t_.objectStore('data'));
+  await new Promise((res, rej) => { t_.oncomplete = res; t_.onerror = t_.onabort = () => rej(t_.error); });
+  return out;
+}
+async function listLocal() { return (await tx('readonly', m => idb(m.getAll()))).sort((a, b) => b.time - a.time); }
+async function getLocal(meta) { const buf = await tx('readonly', (m, d) => idb(d.get(meta.id))); return new File([buf], meta.name, { type: meta.type }); }
+async function delLocal(ids) { await tx('readwrite', (m, d) => Promise.all(ids.flatMap(id => [idb(m.delete(id)), idb(d.delete(id))]))); }
+let persistAsked = false;
+async function saveLocal(file, tool) {
+  try {
+    if (file.size > FILES_CAP) return false;
+    const buf = await file.arrayBuffer(); // stored as bytes: works on every browser, including older iPhones
+    await tx('readwrite', async (m, d) => { const id = await idb(m.add({ name: file.name, type: file.type, size: file.size, tool, time: Date.now() })); await idb(d.put(buf, id)); });
+    const all = await listLocal(); let total = 0; const drop = [];
+    for (const f of all) { total += f.size; if (total > FILES_CAP) drop.push(f.id); }
+    if (drop.length) await delLocal(drop);
+    if (!persistAsked && navigator.storage?.persist) { persistAsked = true; navigator.storage.persist().catch(() => {}); }
+    return true;
+  } catch (e) { console.warn('save failed', e); return false; }
+}
+function filesView() {
+  const v = h(`<section>
+      <div class="tool-head"><a class="back" href="#">${lang === 'ar' ? '→' : '←'} ${esc(t('back'))}</a><h2>${esc(t('myFiles'))}</h2></div>
+      <p class="tool-desc">${esc(t('filesSub'))}</p>
+      <div class="files-bar">
+        <label class="check"><input type="checkbox" name="save" ${saveEnabled() ? 'checked' : ''}> ${esc(t('filesSave'))}</label>
+        <span class="grow"></span>
+        <label class="btn small">${esc(t('filesAdd'))}<input type="file" multiple hidden name="add"></label>
+        <button class="btn small" data-clear>${esc(t('filesClear'))}</button>
+      </div>
+      <p class="hint" data-used></p>
+      <ul class="saved-list"></ul>
+      <div class="error err-slot"></div></section>`);
+  const ul = v.querySelector('.saved-list');
+  const urls = [];
+  async function draw() {
+    urls.splice(0).forEach(u => URL.revokeObjectURL(u));
+    let items = [];
+    try { items = await listLocal(); } catch (e) { v.querySelector('.err-slot').textContent = friendlyError(e); }
+    const total = items.reduce((a, f) => a + f.size, 0);
+    v.querySelector('[data-used]').textContent = items.length ? t('filesUsed', { n: items.length, size: '\u2068' + fmtSize(total) + '\u2069' }) : t('filesEmpty');
+    v.querySelector('[data-clear]').classList.toggle('hidden', !items.length);
+    ul.innerHTML = '';
+    const df = new Intl.DateTimeFormat(lang === 'ar' ? 'ar' : 'en', { dateStyle: 'medium', timeStyle: 'short' });
+    for (const m of items) {
+      const toolName = TOOLS.some(x => x.id === m.tool) ? t('t_' + m.tool) : '';
+      const li = h(`<li><div class="info"><a href="#files" data-dl>${esc(m.name)}</a><span class="meta"><bdi>${fmtSize(m.size)}</bdi> · <bdi>${esc(df.format(m.time))}</bdi>${toolName ? ' · <bdi>' + esc(toolName) + '</bdi>' : ''}</span></div>
+          <div class="btns"><button class="btn small primary" data-use>${esc(t('filesOpen'))}</button><button class="btn small" data-dl>${esc(t('download'))}</button><button class="btn small" data-del>${esc(t('filesDelete'))}</button></div></li>`);
+      li.querySelectorAll('[data-dl]').forEach(b => b.addEventListener('click', async e => {
+        e.preventDefault();
+        const f = await getLocal(m); const u = URL.createObjectURL(f); urls.push(u);
+        const a = document.createElement('a'); a.href = u; a.download = f.name; document.body.appendChild(a); a.click(); a.remove();
+      }));
+      li.querySelector('[data-use]').addEventListener('click', async () => {
+        incomingFiles = [await getLocal(m)]; incomingFrom = 'files';
+        if (location.hash === '#shared') route(true); else location.hash = 'shared';
+      });
+      li.querySelector('[data-del]').addEventListener('click', async () => { await delLocal([m.id]); draw(); });
+      ul.appendChild(li);
+    }
+  }
+  v.querySelector('[name=save]').addEventListener('change', e => { try { localStorage.setItem('saveFiles', e.target.checked ? 'on' : 'off'); } catch {} });
+  v.querySelector('[name=add]').addEventListener('change', async e => { for (const f of e.target.files) await saveLocal(f, ''); e.target.value = ''; draw(); });
+  v.querySelector('[data-clear]').addEventListener('click', async () => {
+    if (!confirm(t('filesClearAsk'))) return;
+    await delLocal((await listLocal()).map(f => f.id)); draw();
+  });
+  draw();
+  return v;
+}
+
+/* ---------------- offline readiness + install ---------------- */
+const offline = { state: 'unknown', p: 0 };
+let installEvt = null;
+const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+function renderOffline(el) {
+  el = el || document.querySelector('[data-off]');
+  if (!el) return;
+  let msg = '', bar = '', cls = 'off-card';
+  if (!navigator.onLine && offline.state !== 'loading') { msg = t('offNow'); cls += ' ok'; }
+  else if (offline.state === 'ready') { msg = '✓ ' + t('offReady'); cls += ' ok'; }
+  else if (offline.state === 'loading') { msg = t('offLoading', { p: offline.p }); bar = `<div class="bar"><i style="width:${offline.p}%"></i></div>`; }
+  else if (offline.state === 'failed') msg = t('offFail');
+  else if (offline.state === 'none') msg = t('offWait');
+  const canInstall = installEvt && !isStandalone();
+  const iosHint = isIos && !isStandalone() && offline.state === 'ready';
+  if (!msg && !canInstall) { el.innerHTML = ''; return; }
+  el.innerHTML = '';
+  const card = h(`<div class="${cls}"><div class="msg">${esc(msg)}${bar}${iosHint ? `<span class="hint" style="display:block">${esc(t('iosInstall'))}</span>` : ''}</div>
+      ${canInstall ? `<button class="btn small primary" data-install>${esc(t('installApp'))}</button>` : ''}</div>`);
+  card.querySelector('[data-install]')?.addEventListener('click', async () => { const ev = installEvt; installEvt = null; ev.prompt(); await ev.userChoice.catch(() => {}); renderOffline(); });
+  el.appendChild(card);
+}
+function updateNet() { document.getElementById('netBadge').classList.toggle('hidden', navigator.onLine); renderOffline(); }
+window.addEventListener('online', () => { updateNet(); if (offline.state === 'failed') askFill(); });
+window.addEventListener('offline', updateNet);
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; renderOffline(); });
+window.addEventListener('appinstalled', () => { installEvt = null; renderOffline(); });
+async function askFill() {
+  try { const reg = await navigator.serviceWorker.ready; reg.active?.postMessage('offline-fill'); } catch {}
+}
+
 /* ---------------- router ---------------- */
 let lastHash = null;
 function route(force) {
@@ -2310,7 +2436,7 @@ function route(force) {
   lastHash = id;
   const tool = TOOLS.find(x => x.id === id);
   $app.innerHTML = '';
-  const view = tool ? tool.render(tool.id) : id === 'shared' ? sharedView() : home();
+  const view = tool ? tool.render(tool.id) : id === 'shared' ? sharedView() : id === 'files' ? filesView() : home();
   $app.appendChild(view);
   if (tool) { addRecent(tool.id); feedIncoming(view); }
   window.scrollTo(0, 0);
@@ -2319,6 +2445,15 @@ window.addEventListener('hashchange', () => route());
 applyLang();
 route();
 
-if ('serviceWorker' in navigator && location.protocol === 'https:') {
-  navigator.serviceWorker.register('sw.js').catch(() => {});
-}
+updateNet();
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  navigator.serviceWorker.addEventListener('message', e => {
+    const d = e.data || {};
+    if (d.type !== 'offline') return;
+    offline.state = d.done ? 'ready' : d.failed ? 'failed' : 'loading';
+    offline.p = Math.round(100 * d.have / d.total);
+    renderOffline();
+  });
+  offline.state = 'loading';
+  navigator.serviceWorker.register('sw.js').then(askFill).catch(() => { offline.state = 'none'; renderOffline(); });
+} else offline.state = 'none';
